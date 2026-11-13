@@ -252,6 +252,30 @@ app:
   uuid_mode:
     en: "UUID mode"
     zh-CN: "UUID 模式"
+  taskbar_group:
+    en: "Taskbar group"
+    zh-CN: "组窗口"
+  taskbar_group_hint:
+    en: "Group by system + client"
+    zh-CN: "按系统标识和客户端分组"
+  taskbar_group_enable:
+    en: "Enable"
+    zh-CN: "一键开启"
+  taskbar_group_ready:
+    en: "On"
+    zh-CN: "已开启"
+  taskbar_group_unsupported:
+    en: "Needs SAP GUI 8.10+"
+    zh-CN: "需 SAP GUI 8.10+"
+  taskbar_group_need_exit:
+    en: "Quit SAP Logon completely, then click again"
+    zh-CN: "请先完全退出 SAP Logon（含托盘图标）再点"
+  taskbar_group_done:
+    en: "Enabled. Restart SAP Logon for it to take effect."
+    zh-CN: "已开启。请重启 SAP Logon 后才会生效"
+  taskbar_group_failed:
+    en: "Could not write the setting (locked by policy?)"
+    zh-CN: "写入失败（可能被组策略锁定）"
   check_update:
     en: "Check for updates"
     zh-CN: "检查更新"

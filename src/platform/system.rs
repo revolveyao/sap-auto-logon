@@ -50,12 +50,69 @@ pub fn prefers_chinese() -> bool {
 /// 各自设图标没有意义。这个键本身也是 8.10 才有的，读不到就当作不支持。
 #[cfg(target_os = "windows")]
 pub fn taskbar_grouped_by_system() -> bool {
-    let Ok(key) = windows_registry::CURRENT_USER.open(r"Software\SAP\General\Appearance") else {
-        return false;
-    };
-    key.get_u32("TaskbarGrouping")
-        .map(|value| value == 2)
-        .unwrap_or(false)
+    taskbar_grouping() == Some(2)
+}
+
+/// `TaskbarGrouping` 的原始值：`2` = 按系统标识和客户端。读不到就是 `None`。
+#[cfg(target_os = "windows")]
+pub fn taskbar_grouping() -> Option<u32> {
+    let key = windows_registry::CURRENT_USER
+        .open(r"Software\SAP\General\Appearance")
+        .ok()?;
+    key.get_u32("TaskbarGrouping").ok()
+}
+
+/// 「组窗口」是 8.10 才加的：更早的 GUI 根本没有这个键，也就谈不上设置。
+pub fn supports_taskbar_group() -> bool {
+    saplogon_version().is_some_and(|major| major >= 8100)
+}
+
+/// 把「组窗口」设成「按系统标识和客户端」。
+///
+/// 调用前必须确认 SAP GUI 没在运行：GUI 退出时会拿内存里的旧值回写这个键，
+/// 运行期间写进去的会在它关掉那一刻被抹掉。
+#[cfg(target_os = "windows")]
+pub fn set_taskbar_grouping_grouped() -> std::io::Result<()> {
+    let hkcu = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER);
+    let (key, _) = hkcu.create_subkey(r"Software\SAP\General\Appearance")?;
+    key.set_value("TaskbarGrouping", &2u32)?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn set_taskbar_grouping_grouped() -> std::io::Result<()> {
+    Ok(())
+}
+
+/// SAP GUI 8.10 默认把窗口标题里的系统信息关着，标题只剩事务名，
+/// 任务栏图标因此拿不到 client。
+#[cfg(target_os = "windows")]
+pub fn additional_title_info_enabled() -> bool {
+    windows_registry::CURRENT_USER
+        .open(r"Software\SAP\SAPGUI Front\SAP Frontend Server\Administration")
+        .ok()
+        .and_then(|key| key.get_u32("ShowAdditionalTitleInfo").ok())
+        .is_some_and(|value| value == 1)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn additional_title_info_enabled() -> bool {
+    false
+}
+
+/// 打开窗口标题里的系统/客户端信息（SAP Note 757964）。
+#[cfg(target_os = "windows")]
+pub fn enable_additional_title_info() -> std::io::Result<()> {
+    let hkcu = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER);
+    let (key, _) =
+        hkcu.create_subkey(r"Software\SAP\SAPGUI Front\SAP Frontend Server\Administration")?;
+    key.set_value("ShowAdditionalTitleInfo", &1u32)?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn enable_additional_title_info() -> std::io::Result<()> {
+    Ok(())
 }
 
 #[cfg(not(target_os = "windows"))]

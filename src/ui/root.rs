@@ -1024,6 +1024,10 @@ impl RootView {
         let autostart = self.set_autostart.clone();
         let logging = self.set_logging.clone();
         let uuid = self.set_uuid.clone();
+        // 「组窗口」这一整套只在 8.10+ 存在；是否已就绪要两项都满足才算。
+        let taskbar_supported = crate::platform::system::supports_taskbar_group();
+        let taskbar_ready = crate::platform::system::taskbar_grouped_by_system()
+            && crate::platform::system::additional_title_info_enabled();
         let landscape_path = crate::landscape::locate::landscape_path()
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "—".into());
@@ -1136,6 +1140,45 @@ impl RootView {
                             });
                         })
                         .into_any_element(),
+                ))
+                .child(row(
+                    t!("app.taskbar_group").to_string(),
+                    {
+                        let group_this = this.clone();
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(muted)
+                                    .child(t!("app.taskbar_group_hint").to_string()),
+                            )
+                            .child(if !taskbar_supported {
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(muted)
+                                    .child(t!("app.taskbar_group_unsupported").to_string())
+                                    .into_any_element()
+                            } else if taskbar_ready {
+                                div()
+                                    .text_size(px(11.))
+                                    .child(t!("app.taskbar_group_ready").to_string())
+                                    .into_any_element()
+                            } else {
+                                Button::new("enable-taskbar-group")
+                                    .label(t!("app.taskbar_group_enable").to_string())
+                                    .on_click(move |_, window, cx| {
+                                        group_this.update(cx, |view, cx| {
+                                            view.enable_taskbar_group(window, cx);
+                                        });
+                                    })
+                                    .into_any_element()
+                            })
+                            .into_any_element()
+                    },
                 ))
                 .child(row(
                     t!("app.check_update").to_string(),
@@ -1380,6 +1423,56 @@ impl RootView {
         self.settings_target = false;
         self.status = t!("app.settings_saved").to_string();
         cx.notify();
+    }
+
+    /// 一键开启「组窗口」+ 窗口标题里的系统信息。
+    ///
+    /// 两个键都只对**新开的**会话窗口生效；而且 SAP GUI 运行时会拿内存里的旧值
+    /// 回写 Appearance，所以必须先让它完全退出，否则写进去的会在它关掉时被抹掉。
+    fn enable_taskbar_group(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if crate::platform::process::is_running("saplogon.exe")
+            || crate::platform::process::is_running("sapgui.exe")
+        {
+            self.toast(
+                t!("app.taskbar_group_need_exit").to_string(),
+                NotificationType::Warning,
+                window,
+                cx,
+            );
+            return;
+        }
+
+        let mut failed: Option<String> = None;
+        if !crate::platform::system::taskbar_grouped_by_system() {
+            if let Err(error) = crate::platform::system::set_taskbar_grouping_grouped() {
+                failed = Some(format!("TaskbarGrouping: {error}"));
+            }
+        }
+        if failed.is_none() && !crate::platform::system::additional_title_info_enabled() {
+            if let Err(error) = crate::platform::system::enable_additional_title_info() {
+                failed = Some(format!("ShowAdditionalTitleInfo: {error}"));
+            }
+        }
+        if let Some(error) = failed {
+            log::warn!("开启组窗口失败：{error}");
+            self.toast(
+                t!("app.taskbar_group_failed").to_string(),
+                NotificationType::Error,
+                window,
+                cx,
+            );
+            return;
+        }
+
+        // 回读确认：组策略可能把这个键锁死，写的时候不报错但值没变。
+        let written = crate::platform::system::taskbar_grouped_by_system()
+            && crate::platform::system::additional_title_info_enabled();
+        let (message, kind) = if written {
+            (t!("app.taskbar_group_done").to_string(), NotificationType::Success)
+        } else {
+            (t!("app.taskbar_group_failed").to_string(), NotificationType::Error)
+        };
+        self.toast(message, kind, window, cx);
     }
 
     fn ask_delete(&mut self, service_id: String, window: &mut Window, cx: &mut Context<Self>) {
