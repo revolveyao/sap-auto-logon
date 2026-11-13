@@ -63,6 +63,15 @@ fn main() {
             gpui_kit::component::set_locale(locale);
             rust_i18n::set_locale(locale);
 
+            // 根表面的底色由 gpui-component 的插件铺；有材质时必须先把它摘掉，
+            // 否则那层不透明底色会把云母整个盖住。必须在 `init` 之后注册，
+            // 才能盖过组件自己注册的插件。
+            ui::surface::set_opaque(matches!(
+                background_appearance(&settings.general.material),
+                WindowBackgroundAppearance::Opaque
+            ));
+            ui::surface::install(cx);
+
             let settings_for_view = settings.clone();
             let options = window_options(&settings);
             // 材质生效与否肉眼不好判断（浅色 Mica 本来就淡），留一行日志便于核对。

@@ -115,6 +115,30 @@ pub fn show() {
     }
 }
 
+/// 让 DWM 用深色变体画背板与窗口边框。
+///
+/// gpui 里有同名封装却没被调用过（`configure_dwm_dark_mode` 是死代码），标题栏又是
+/// 我们自己画的，不设的话深色主题下拿到的是浅色云母，和界面不是一个色温。
+#[cfg(target_os = "windows")]
+pub fn set_dark_mode(dark: bool) {
+    use windows_sys::Win32::Graphics::Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute};
+
+    let Some(hwnd) = main_window() else {
+        log::warn!("设置 DWM 深色模式：找不到主窗口");
+        return;
+    };
+    let value: i32 = i32::from(dark);
+    let status = unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE as u32,
+            &value as *const _ as *const _,
+            std::mem::size_of::<i32>() as u32,
+        )
+    };
+    log::info!("DWM 深色模式={dark}：hr={status}");
+}
+
 /// 读回窗口实际用的系统背景类型：2 = Mica、4 = Mica Alt、1 = 无。
 ///
 /// 材质是否生效肉眼很难判断（浅色 Mica 本来就淡），日志里有个确切值省得靠猜。
@@ -144,3 +168,5 @@ pub fn show() {}
 pub fn backdrop_type() -> Option<u32> {
     None
 }
+#[cfg(not(target_os = "windows"))]
+pub fn set_dark_mode(_dark: bool) {}

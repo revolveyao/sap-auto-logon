@@ -66,9 +66,10 @@ impl RenderOnce for Card {
         let border = theme.border;
         // 选中用信息蓝，不用 primary——深色主题里 primary 接近纯黑，边框像画框。
         let accent = theme.info;
-        // 深色主题的默认背景偏纯黑，用更接近 quiet-md 的深灰（#1F1F21）。
+        // 深色主题的默认背景偏纯黑，用比 Mica 略亮一档的深灰（#2A2A2C）：
+        // 窗口底是云母的深灰，卡片再暗就糊在一起了。
         let background = if theme.is_dark() {
-            gpui_kit::rgb(0x1F1F21).into()
+            gpui_kit::rgb(0x2A2A2C).into()
         } else {
             theme.background
         };

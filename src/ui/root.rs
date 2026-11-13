@@ -291,6 +291,9 @@ impl RootView {
             "窗口背景读回：{:?}（2 = Mica）",
             crate::platform::window::backdrop_type()
         );
+        // 启动时就把保存的主题档套上。`theme::init` 固定从浅色起步，不在这里套一次
+        // 的话，保存的深色档要等系统外观变化才生效，云母也会停在浅色变体。
+        view.apply_theme(window, cx);
 
         // 「跟随系统」必须跟到运行中的切换：外观变化由窗口通知，这里重切主题。
         let this = cx.entity().downgrade();
@@ -361,8 +364,13 @@ impl RootView {
                     .to_string();
                     let _ = this.settings.save();
                     // 材质是窗口属性，能当场换掉，不必重启。
-                    window.set_background_appearance(material_appearance(
-                        &this.settings.general.material,
+                    let appearance = material_appearance(&this.settings.general.material);
+                    window.set_background_appearance(appearance);
+                    // 根表面的底色要跟着一起切：不透明档必须铺色，否则交换链清屏
+                    // 是不透明黑，不铺就是一块黑窗。
+                    crate::ui::surface::set_opaque(matches!(
+                        appearance,
+                        gpui_kit::WindowBackgroundAppearance::Opaque
                     ));
                     cx.notify();
                 }
@@ -1386,6 +1394,10 @@ impl RootView {
     fn apply_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mode = theme_mode(&self.settings.general.theme, window.appearance());
         gpui_kit::component::Theme::change(mode, Some(window), cx);
+        crate::platform::window::set_dark_mode(matches!(
+            mode,
+            gpui_kit::component::ThemeMode::Dark
+        ));
     }
 
     /// 「跟随系统」时窗口外观一变就跟上；固定浅色/深色是用户的明确选择，不响应系统。
@@ -1403,6 +1415,10 @@ impl RootView {
         }
         log::info!("主题跟随系统：{mode:?}");
         gpui_kit::component::Theme::change(mode, None, cx);
+        crate::platform::window::set_dark_mode(matches!(
+            mode,
+            gpui_kit::component::ThemeMode::Dark
+        ));
         cx.notify();
     }
 
@@ -3129,28 +3145,27 @@ fn element_id(prefix: &'static str, value: &str) -> ElementId {
 
 impl Render for RootView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // 深色下外壳用比纯黑浅一档的灰。
-        let mut shell: gpui_kit::Hsla = if cx.theme().is_dark() {
+        // 深色下不透明档的底色；有材质时整窗不铺底色，让云母原样透出来。
+        let shell: gpui_kit::Hsla = if cx.theme().is_dark() {
             gpui_kit::rgb(0x161618).into()
         } else {
             cx.theme().sidebar
         };
-        // 有材质时外壳必须半透明，否则底色把窗口背后的 Mica 全挡住了。
-        // 浅色 Mica 的底色本来就接近白，透明度给低了等于没有，所以浅色档压得更狠。
-        if !matches!(
+        let opaque = matches!(
             material_appearance(&self.settings.general.material),
             gpui_kit::WindowBackgroundAppearance::Opaque
-        ) {
-            shell.a = if cx.theme().is_dark() { 0.68 } else { 0.62 };
-        }
+        );
 
         // 顶栏浮层不占布局，所以内容从窗口顶端开始，靠 padding 让开按钮。
-        let root = div()
-            .relative()
-            .size_full()
-            .flex()
-            .flex_col()
-            .bg(shell)
+        // 有材质时整窗就是云母，和记事本标题栏同一块料——再压一层半透明壳会把
+        // 材质盖死：深色下那层几乎全黑，看起来就是一块黑窗。需要面色的组件自己画。
+        // 不透明档必须铺色：那时交换链清屏是不透明白，不铺就漏白。
+        let mut root = div().relative().size_full().flex().flex_col();
+        if opaque {
+            root = root.bg(shell);
+        }
+
+        let root = root
             .child(
                 div()
                     .flex_1()
