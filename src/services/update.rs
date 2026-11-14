@@ -4,13 +4,16 @@
 //! 安装目录、开始菜单快捷方式和卸载记录都归安装器管，绕过它直接换文件，
 //! 卸载项与文件就会对不上。所以这里只负责"找到、下载、交给安装器"。
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::core::paths;
 
 const REPO: &str = "revolveyao/sap-auto-logon";
 const USER_AGENT: &str = "sap-auto-logon";
+/// 小于这个尺寸的一定不是完整的安装包。
+const MIN_SETUP_SIZE: u64 = 1024 * 1024;
 
 /// 发现的新版本。
 #[derive(Clone)]
@@ -58,22 +61,64 @@ pub fn check() -> anyhow::Result<Option<Release>> {
     }))
 }
 
-/// 把安装包下到应用数据目录，返回本地路径。
-pub fn download(release: &Release) -> anyhow::Result<PathBuf> {
-    let dir = paths::local_dir().join("updates");
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("SAP-Auto-Logon-{}-setup.exe", release.version));
+fn updates_dir() -> PathBuf {
+    paths::local_dir().join("updates")
+}
 
-    let response = ureq::get(&release.setup_url)
-        .set("User-Agent", USER_AGENT)
-        .call()?;
+/// 安装包落点。多个版本各占一份，升级到同版本时直接复用。
+pub fn setup_path(version: &str) -> PathBuf {
+    updates_dir().join(format!("SAP-Auto-Logon-{version}-setup.exe"))
+}
+
+/// 已经下好的安装包。有就不用再下一次——用户可能上次取消过安装。
+pub fn cached_setup(release: &Release) -> Option<PathBuf> {
+    let path = setup_path(&release.version);
+    let size = path.metadata().ok().map(|meta| meta.len()).unwrap_or(0);
+    (size >= MIN_SETUP_SIZE).then_some(path)
+}
+
+/// 下载安装包，走系统代理（如果系统启用了）。
+///
+/// `on_progress` 在下载线程上被调用：(已收字节, 总字节)。总长未知时第二项为 `None`
+/// ——GitHub 的下载接口一般带 `Content-Length`，但重定向后不一定。
+pub fn download(
+    release: &Release,
+    mut on_progress: impl FnMut(u64, Option<u64>),
+) -> anyhow::Result<PathBuf> {
+    let path = setup_path(&release.version);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    // 先写 `.part` 再改名：中途失败留下的半个文件不会被 `cached_setup` 当成可用安装包。
+    let temp = path.with_extension("exe.part");
+
+    let response = agent().get(&release.setup_url).call()?;
+    let total = response
+        .header("Content-Length")
+        .and_then(|value| value.parse::<u64>().ok());
     let mut reader = response.into_reader();
-    let mut file = std::fs::File::create(&path)?;
-    std::io::copy(&mut reader, &mut file)?;
+    let mut file = std::fs::File::create(&temp)?;
+
+    let mut buffer = vec![0u8; 64 * 1024];
+    let mut received = 0u64;
+    on_progress(0, total);
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        file.write_all(&buffer[..read])?;
+        received += read as u64;
+        on_progress(received, total);
+    }
     file.flush()?;
-    if file.metadata()?.len() < 1024 * 1024 {
+    drop(file);
+
+    if received < MIN_SETUP_SIZE {
+        let _ = std::fs::remove_file(&temp);
         return Err(anyhow::anyhow!("下载的安装包不完整"));
     }
+    std::fs::rename(&temp, &path)?;
     Ok(path)
 }
 
@@ -84,9 +129,30 @@ pub fn run_installer(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 所有出网请求共用一个 agent：代理、超时、UA 只在这里定一次。
+fn agent() -> ureq::Agent {
+    let mut builder = ureq::AgentBuilder::new()
+        .user_agent(USER_AGENT)
+        .timeout_connect(Duration::from_secs(15));
+
+    // 系统开着代理时按它出网：内网解析到的 GitHub 地址通常是假的，直连必失败。
+    match crate::platform::system::system_proxy() {
+        Some(proxy) => match ureq::Proxy::new(&proxy) {
+            Ok(parsed) => {
+                log::info!("更新：走系统代理 {proxy}");
+                builder = builder.proxy(parsed);
+            }
+            Err(error) => log::warn!("更新：系统代理不可用（{proxy}）：{error}"),
+        },
+        None => log::info!("更新：直连（系统未启用代理）"),
+    }
+
+    builder.build()
+}
+
 fn get(url: &str) -> anyhow::Result<String> {
-    let response = ureq::get(url)
-        .set("User-Agent", USER_AGENT)
+    let response = agent()
+        .get(url)
         .set("Accept", "application/vnd.github+json")
         .call()?;
     Ok(response.into_string()?)
@@ -107,4 +173,3 @@ fn is_newer(candidate: &str, current: &str) -> bool {
     right.resize(len, 0);
     left > right
 }
-

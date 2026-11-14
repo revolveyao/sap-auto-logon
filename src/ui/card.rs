@@ -8,7 +8,7 @@ use gpui_kit::base::motion::{transition, Transition};
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::{
     AnyElement, App, ElementId, InteractiveElement as _, IntoElement, ParentElement, RenderOnce,
-    StyleRefinement, Styled, Window, div, px,
+    StyleRefinement, Styled, Window, div, rems,
 };
 
 #[derive(IntoElement)]
@@ -100,10 +100,10 @@ impl RenderOnce for Card {
             .id(self.id)
             .flex()
             .flex_col()
-            .gap(px(6.))
-            .px(px(12.))
-            .py(px(10.))
-            .rounded(px(10.))
+            .gap(rems(0.375))
+            .px(rems(0.75))
+            .py(rems(0.625))
+            .rounded(rems(0.625))
             .border_1()
             .border_color(border_color)
             .bg(surface)

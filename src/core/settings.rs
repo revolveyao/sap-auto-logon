@@ -71,6 +71,8 @@ pub struct General {
     pub log_level: String,
     /// 空 = 默认目录
     pub log_dir: String,
+    /// 每次启动时检查一次新版本
+    pub auto_check_update: bool,
 }
 
 impl Default for General {
@@ -90,6 +92,7 @@ impl Default for General {
             logging: true,
             log_level: "error".into(),
             log_dir: String::new(),
+            auto_check_update: true,
         }
     }
 }

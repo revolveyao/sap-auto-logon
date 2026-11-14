@@ -1,12 +1,14 @@
 //! 主视图：卡片网格 + 右侧状态栏，全部操作走右键菜单与弹框。
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 use gpui_kit::base::InteractiveElementExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
+use gpui_kit::component::progress::Progress;
 use gpui_kit::component::{Icon, IconName};
 use gpui_kit::component::label::Label;
 use gpui_kit::component::notification::NotificationType;
@@ -22,7 +24,347 @@ use crate::landscape::model::{Landscape, Service, ServiceKind, TreeNode};
 use crate::services::shcut::{self, LoginRequest};
 use crate::ui::card::Card;
 
-const TITLE_BAR: f32 = 40.;
+/// 顶栏高度，单位 rem（1 rem = 主题基准字号）。
+const TITLE_BAR: f32 = 2.5;
+
+/// 更新对话框处在哪一步。对话框按它换内容：等决定、等下载、等确认安装，
+/// 每一步都只有一个主操作，用户不用猜现在发生了什么。
+#[derive(Clone)]
+enum UpdateStage {
+    /// 发现新版本，等用户决定下不下载。
+    Available,
+    /// 正在下载安装包。
+    Downloading { received: u64, total: Option<u64> },
+    /// 安装包已在本地，等用户确认安装。
+    Ready { path: PathBuf },
+}
+
+/// 更新流程：检查、下载、安装三步的状态机。
+///
+/// 单独做成实体而不是挂在 `RootView` 上，是因为对话框的构建闭包只在打开时跑一次；
+/// 进度条和按钮必须挂在会自己重绘的实体上，否则界面会停在打开那一刻。
+struct UpdateFlow {
+    release: Option<crate::services::update::Release>,
+    stage: UpdateStage,
+    /// 上一次操作失败的原因，就地显示在对话框里。
+    error: Option<String>,
+    /// 正在检查或下载，避免重复点击。
+    busy: bool,
+}
+
+impl UpdateFlow {
+    fn new() -> Self {
+        Self {
+            release: None,
+            stage: UpdateStage::Available,
+            error: None,
+            busy: false,
+        }
+    }
+
+    /// 查新版本。`manual` 区分手动点和启动时自动查：自动查没新版本、没网都保持安静，
+    /// 否则每次开机都要弹一句「已经是最新」。
+    fn check(&mut self, manual: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        self.busy = true;
+        cx.notify();
+
+        let this = cx.entity().clone();
+        cx.spawn_in(window, async move |_weak, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { crate::services::update::check() })
+                .await;
+            let _ = this.update_in(cx, |flow, window, cx| {
+                flow.busy = false;
+                match result {
+                    Ok(Some(release)) => {
+                        // 上一轮已经下好的安装包直接复用，不必再下一次。
+                        flow.stage = match crate::services::update::cached_setup(&release) {
+                            Some(path) => UpdateStage::Ready { path },
+                            None => UpdateStage::Available,
+                        };
+                        flow.error = None;
+                        flow.release = Some(release);
+                        flow.open_dialog(window, cx);
+                    }
+                    Ok(None) if manual => window.push_notification(
+                        (NotificationType::Success, t!("app.update_latest").to_string()),
+                        cx,
+                    ),
+                    Ok(None) => {}
+                    Err(error) if manual => window.push_notification(
+                        (
+                            NotificationType::Error,
+                            t!("app.update_failed", error = error.to_string()).to_string(),
+                        ),
+                        cx,
+                    ),
+                    Err(error) => log::warn!("自动检查更新失败：{error}"),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 打开更新对话框。框体只搭一次，内容由本实体渲染，状态一变就重绘。
+    fn open_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(release) = self.release.clone() else {
+            return;
+        };
+        let body = cx.entity().clone();
+        window.open_dialog(cx, move |dialog, window, _cx| {
+            dialog
+                .title(t!("app.update_title", version = release.version.clone()).to_string())
+                .w(dialog_width(window, 28.75))
+                .child(body.clone())
+        });
+    }
+
+    /// 下载安装包。进度写进 `stage`，界面靠本实体的重绘跟着走。
+    ///
+    /// 下载是阻塞的：字节数经共享原子变量回传，再由一个 UI 侧的轮询转成刷新——
+    /// 在下载线程里直接更新视图会撞 gpui 的借用检查。
+    fn start_download(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+        let Some(release) = self.release.clone() else {
+            return;
+        };
+        if self.busy {
+            return;
+        }
+        self.busy = true;
+        self.error = None;
+        self.stage = UpdateStage::Downloading {
+            received: 0,
+            total: None,
+        };
+        cx.notify();
+
+        let received = Arc::new(AtomicU64::new(0));
+        let total = Arc::new(AtomicU64::new(0));
+        let finished = Arc::new(AtomicBool::new(false));
+
+        {
+            let received = received.clone();
+            let total = total.clone();
+            let finished = finished.clone();
+            let this = cx.entity().clone();
+            cx.spawn_in(window, async move |_weak, cx| loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(120))
+                    .await;
+                if finished.load(Ordering::Relaxed) {
+                    break;
+                }
+                let (got, len) = (
+                    received.load(Ordering::Relaxed),
+                    total.load(Ordering::Relaxed),
+                );
+                let alive = this.update_in(cx, |flow, _window, cx| {
+                    // 收尾可能已经先一步把阶段改成 Ready，这里再写回会卡在进度条上。
+                    if matches!(flow.stage, UpdateStage::Downloading { .. }) {
+                        flow.stage = UpdateStage::Downloading {
+                            received: got,
+                            total: (len > 0).then_some(len),
+                        };
+                        cx.notify();
+                    }
+                });
+                if alive.is_err() {
+                    break;
+                }
+            })
+            .detach();
+        }
+
+        let this = cx.entity().clone();
+        cx.spawn_in(window, async move |_weak, cx| {
+            let (report_received, report_total) = (received.clone(), total.clone());
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::services::update::download(&release, move |got, len| {
+                        report_received.store(got, Ordering::Relaxed);
+                        report_total.store(len.unwrap_or(0), Ordering::Relaxed);
+                    })
+                })
+                .await;
+            finished.store(true, Ordering::Relaxed);
+            let _ = this.update_in(cx, |flow, _window, cx| {
+                flow.busy = false;
+                match result {
+                    Ok(path) => {
+                        flow.stage = UpdateStage::Ready { path };
+                        flow.error = None;
+                    }
+                    Err(error) => {
+                        log::warn!("更新：下载失败 {error}");
+                        // 退回「可下载」那一步并就地报错：重试不必重新查版本。
+                        flow.stage = UpdateStage::Available;
+                        flow.error = Some(
+                            t!("app.update_failed", error = error.to_string()).to_string(),
+                        );
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 安装：拉起安装器后必须退出，脚本要先结束本进程才能覆盖文件。
+    fn install(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let UpdateStage::Ready { path } = self.stage.clone() else {
+            return;
+        };
+        match crate::services::update::run_installer(&path) {
+            Ok(()) => {
+                log::info!("更新：已拉起安装器，退出当前进程");
+                cx.quit();
+            }
+            Err(error) => {
+                log::warn!("更新：拉起安装器失败 {error}");
+                self.error = Some(t!("app.update_failed", error = error.to_string()).to_string());
+                cx.notify();
+            }
+        }
+    }
+}
+
+impl Render for UpdateFlow {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let muted = cx.theme().muted_foreground;
+        let danger = cx.theme().danger;
+        let notes = match self.release.as_ref() {
+            Some(release) if !release.notes.trim().is_empty() => release
+                .notes
+                .lines()
+                .take(12)
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => t!("app.update_no_notes").to_string(),
+        };
+
+        // 版本与更新说明三个阶段都在，进度和按钮在它下面变。
+        let mut body = div()
+            .flex()
+            .flex_col()
+            .gap(rems(0.75))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(rems(0.5))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(
+                                t!("app.current_version", version = env!("CARGO_PKG_VERSION"))
+                                    .to_string(),
+                            ),
+                    )
+                    .child(div().text_xs().child(notes)),
+            );
+
+        match &self.stage {
+            UpdateStage::Downloading { received, total } => {
+                let (received, total) = (*received, *total);
+                let percent = total
+                    .map(|total| (received as f32 / total.max(1) as f32 * 100.).clamp(0., 100.));
+                body = body.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(rems(0.375))
+                        .child(
+                            div()
+                                .text_xs()
+                                .child(t!("app.update_downloading").to_string()),
+                        )
+                        .child(
+                            Progress::new("update-progress")
+                                .small()
+                                .value(percent.unwrap_or(0.))
+                                // 总长未知时退回不确定态的滑动条，而不是停在 0%。
+                                .loading(percent.is_none())
+                                .accessibility_label(t!("app.update_downloading").to_string()),
+                        )
+                        .child(
+                            div()
+                                .text_size(rems(0.6875))
+                                .text_color(muted)
+                                .child(progress_text(received, total)),
+                        ),
+                );
+            }
+            UpdateStage::Ready { .. } => {
+                body = body
+                    .child(div().text_xs().child(t!("app.update_ready").to_string()));
+            }
+            UpdateStage::Available => {}
+        }
+
+        if let Some(message) = self.error.clone() {
+            body = body
+                .child(div().text_size(rems(0.6875)).text_color(danger).child(message));
+        }
+
+        let this = cx.entity().clone();
+        let cancel = Button::new("update-later")
+            .label(t!("app.cancel").to_string())
+            .on_click(|_, window, cx| window.close_dialog(cx));
+
+        // 动作行：任何时刻只有一个主操作。
+        let actions = match &self.stage {
+            UpdateStage::Available => {
+                let download = this.clone();
+                div()
+                    .flex()
+                    .flex_row()
+                    .justify_end()
+                    .gap(rems(0.5))
+                    .child(cancel)
+                    .child(
+                        Button::new("update-download")
+                            .primary()
+                            .label(t!("app.update_install").to_string())
+                            // 不关对话框：同一个框就地变成进度条。
+                            .on_click(move |_, window, cx| {
+                                download.update(cx, |flow, cx| flow.start_download(window, cx));
+                            }),
+                    )
+            }
+            UpdateStage::Ready { .. } => {
+                let install = this.clone();
+                div()
+                    .flex()
+                    .flex_row()
+                    .justify_end()
+                    .gap(rems(0.5))
+                    .child(cancel)
+                    .child(
+                        Button::new("update-install-now")
+                            .primary()
+                            .label(t!("app.update_install_now").to_string())
+                            .on_click(move |_, window, cx| {
+                                install.update(cx, |flow, cx| flow.install(window, cx));
+                            }),
+                    )
+            }
+            // 下载期间不给按钮：没有真正的取消能力时，一个「取消」按钮是假承诺。
+            UpdateStage::Downloading { .. } => div().flex().flex_row().justify_end().gap(rems(0.5)),
+        };
+
+        body.child(actions)
+    }
+}
 
 /// 新建快捷方式的草稿：选中的目标文件夹与基础系统。
 #[derive(Clone)]
@@ -103,10 +445,10 @@ pub struct RootView {
     username_input: Entity<InputState>,
     password_input: Entity<InputState>,
     remember: bool,
-    /// 已发现的新版本；`None` = 还没查过或已经是最新。
-    update_release: Option<crate::services::update::Release>,
-    /// 正在检查或下载，避免重复点击。
-    update_busy: bool,
+    /// 更新流程（检查 / 下载 / 安装），更新对话框显示的就是它。
+    update: Entity<UpdateFlow>,
+    /// 每次启动自动检查更新。
+    set_auto_check: Entity<bool>,
 }
 
 impl RootView {
@@ -142,6 +484,8 @@ impl RootView {
         let set_autostart = cx.new(|_| settings.general.autostart);
         let set_logging = cx.new(|_| settings.general.logging);
         let set_uuid = cx.new(|_| settings.sap.use_uuid);
+        let set_auto_check = cx.new(|_| settings.general.auto_check_update);
+        let update = cx.new(|_| UpdateFlow::new());
         let new_folder_select = cx.new(|cx| SelectState::new(Vec::<String>::new(), None, window, cx));
         let new_base_select = cx.new(|cx| SelectState::new(Vec::<String>::new(), None, window, cx));
 
@@ -278,8 +622,8 @@ impl RootView {
             username_input: username_input.clone(),
             password_input: password_input.clone(),
             remember: true,
-            update_release: None,
-            update_busy: false,
+            update,
+            set_auto_check,
         };
         view.reload(cx);
 
@@ -444,6 +788,20 @@ impl RootView {
         .detach();
 
         view.start_tray_poll(window, cx);
+
+        // 启动后查一次新版本：等窗口先画出来再查，不和启动抢带宽。
+        // 没有新版本、或者根本没网，都保持安静——开机弹一句「已经是最新」是噪音。
+        if view.settings.general.auto_check_update {
+            let this = cx.entity().clone();
+            cx.spawn_in(window, async move |_weak, cx| {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(3))
+                    .await;
+                let _ = this.update_in(cx, |view, window, cx| view.check_update(false, window, cx));
+            })
+            .detach();
+        }
+
         view
     }
 
@@ -875,18 +1233,18 @@ impl RootView {
         let workdir = self.edit_workdir.clone();
         let muted = cx.theme().muted_foreground;
 
-        window.open_dialog(cx, move |dialog, _window, _cx| {
+        window.open_dialog(cx, move |dialog, window, _cx| {
             let confirm = this.clone();
             let row = |label: String, input: &Entity<InputState>| {
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(10.))
-                    .pb(px(10.))
+                    .gap(rems(0.625))
+                    .pb(rems(0.625))
                     .child(
                         div()
-                            .w(px(72.))
-                            .text_size(px(12.))
+                            .w(rems(4.5))
+                            .text_xs()
                             .text_color(muted)
                             .child(label),
                     )
@@ -894,7 +1252,7 @@ impl RootView {
             };
             dialog
                 .title(t!("app.edit_params").to_string())
-                .w(px(560.))
+                .w(dialog_width(window, 35.0))
                 .child(row(t!("app.name").to_string(), &name))
                 .child(row(t!("app.client").to_string(), &client))
                 .child(row(t!("app.user").to_string(), &user))
@@ -904,12 +1262,12 @@ impl RootView {
                     div()
                         .flex()
                         .items_center()
-                        .gap(px(10.))
-                        .pb(px(10.))
+                        .gap(rems(0.625))
+                        .pb(rems(0.625))
                         .child(
                             div()
-                                .w(px(72.))
-                                .text_size(px(12.))
+                                .w(rems(4.5))
+                                .text_xs()
                                 .text_color(muted)
                                 .child(t!("app.work_dir").to_string()),
                         )
@@ -928,7 +1286,7 @@ impl RootView {
                     div()
                         .flex()
                         .flex_row()
-                        .gap(px(8.))
+                        .gap(rems(0.5))
                         .child(
                             Button::new("edit-cancel")
                                 .label(t!("app.cancel").to_string())
@@ -1032,6 +1390,7 @@ impl RootView {
         let autostart = self.set_autostart.clone();
         let logging = self.set_logging.clone();
         let uuid = self.set_uuid.clone();
+        let auto_check = self.set_auto_check.clone();
         // 「组窗口」这一整套只在 8.10+ 存在；是否已就绪要两项都满足才算。
         let taskbar_supported = crate::platform::system::supports_taskbar_group();
         let taskbar_ready = crate::platform::system::taskbar_grouped_by_system()
@@ -1040,27 +1399,29 @@ impl RootView {
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "—".into());
 
-        window.open_dialog(cx, move |dialog, _window, cx| {
+        window.open_dialog(cx, move |dialog, window, cx| {
             let muted = cx.theme().muted_foreground;
             let theme = this.read(cx).settings.general.theme.clone();
             let autostart_value = *autostart.read(cx);
             let logging_value = *logging.read(cx);
             let uuid_value = *uuid.read(cx);
+            let auto_check_value = *auto_check.read(cx);
             let autostart_click = autostart.clone();
             let logging_click = logging.clone();
             let uuid_click = uuid.clone();
+            let auto_check_click = auto_check.clone();
             let save_this = this.clone();
 
             let row = |label: String, content: AnyElement| {
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(10.))
-                    .pb(px(10.))
+                    .gap(rems(0.625))
+                    .pb(rems(0.625))
                     .child(
                         div()
-                            .w(px(72.))
-                            .text_size(px(12.))
+                            .w(rems(4.5))
+                            .text_xs()
                             .text_color(muted)
                             .child(label),
                     )
@@ -1082,13 +1443,13 @@ impl RootView {
 
             dialog
                 .title(t!("app.settings").to_string())
-                .w(px(560.))
+                .w(dialog_width(window, 35.0))
                 .child(row(
                     t!("app.appearance").to_string(),
                     div()
                         .flex()
                         .flex_row()
-                        .gap(px(8.))
+                        .gap(rems(0.5))
                         .child(theme_button("system", t!("app.theme_system").to_string(), theme.is_empty() || theme == "system"))
                         .child(theme_button("light", t!("app.theme_light").to_string(), theme == "light"))
                         .child(theme_button("dark", t!("app.theme_dark").to_string(), theme == "dark"))
@@ -1157,22 +1518,22 @@ impl RootView {
                             .flex()
                             .flex_row()
                             .items_center()
-                            .gap(px(8.))
+                            .gap(rems(0.5))
                             .child(
                                 div()
-                                    .text_size(px(11.))
+                                    .text_size(rems(0.6875))
                                     .text_color(muted)
                                     .child(t!("app.taskbar_group_hint").to_string()),
                             )
                             .child(if !taskbar_supported {
                                 div()
-                                    .text_size(px(11.))
+                                    .text_size(rems(0.6875))
                                     .text_color(muted)
                                     .child(t!("app.taskbar_group_unsupported").to_string())
                                     .into_any_element()
                             } else if taskbar_ready {
                                 div()
-                                    .text_size(px(11.))
+                                    .text_size(rems(0.6875))
                                     .child(t!("app.taskbar_group_ready").to_string())
                                     .into_any_element()
                             } else {
@@ -1189,16 +1550,29 @@ impl RootView {
                     },
                 ))
                 .child(row(
+                    t!("app.update_section").to_string(),
+                    Checkbox::new("set-auto-check")
+                        .checked(auto_check_value)
+                        .label(t!("app.auto_check_update").to_string())
+                        .on_click(move |value: &bool, _window, cx| {
+                            auto_check_click.update(cx, |state, cx| {
+                                *state = *value;
+                                cx.notify();
+                            });
+                        })
+                        .into_any_element(),
+                ))
+                .child(row(
                     t!("app.check_update").to_string(),
                     {
                         let check_this = this.clone();
                         div()
                             .flex()
                             .items_center()
-                            .gap(px(8.))
+                            .gap(rems(0.5))
                             .child(
                                 div()
-                                    .text_size(px(11.))
+                                    .text_size(rems(0.6875))
                                     .text_color(muted)
                                     .child(format!("v{}", env!("CARGO_PKG_VERSION"))),
                             )
@@ -1207,7 +1581,7 @@ impl RootView {
                                     .label(t!("app.check_update").to_string())
                                     .on_click(move |_, window, cx| {
                                         check_this.update(cx, |view, cx| {
-                                            view.check_update(window, cx);
+                                            view.check_update(true, window, cx);
                                         });
                                     }),
                             )
@@ -1216,7 +1590,7 @@ impl RootView {
                 ))
                 .child(
                     div()
-                        .text_size(px(11.))
+                        .text_size(rems(0.6875))
                         .text_color(muted)
                         .child(t!("app.landscape_path", path = landscape_path.clone()).to_string()),
                 )
@@ -1224,7 +1598,7 @@ impl RootView {
                     div()
                         .flex()
                         .flex_row()
-                        .gap(px(8.))
+                        .gap(rems(0.5))
                         .child(
                             Button::new("settings-cancel")
                                 .label(t!("app.cancel").to_string())
@@ -1245,149 +1619,10 @@ impl RootView {
         });
     }
 
-    /// 检查更新：网络请求放后台，结果回到 UI 再决定弹什么。
-    fn check_update(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.update_busy {
-            return;
-        }
-        self.update_busy = true;
-        cx.notify();
-
-        let this = cx.entity().clone();
-        cx.spawn_in(window, async move |_weak, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move { crate::services::update::check() })
-                .await;
-            let _ = this.update_in(cx, |view, window, cx| {
-                view.update_busy = false;
-                match result {
-                    Ok(Some(release)) => {
-                        view.update_release = Some(release);
-                        view.open_update_dialog(window, cx);
-                    }
-                    Ok(None) => view.toast(
-                        t!("app.update_latest").to_string(),
-                        NotificationType::Success,
-                        window,
-                        cx,
-                    ),
-                    Err(error) => view.show_error_dialog(
-                        t!("app.update_failed", error = error.to_string()).to_string(),
-                        window,
-                        cx,
-                    ),
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    fn open_update_dialog(&self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(release) = self.update_release.clone() else {
-            return;
-        };
-        let this = cx.entity().clone();
-        window.open_dialog(cx, move |dialog, _window, cx| {
-            let muted = cx.theme().muted_foreground;
-            let install = this.clone();
-            let notes = if release.notes.is_empty() {
-                t!("app.update_no_notes").to_string()
-            } else {
-                release
-                    .notes
-                    .lines()
-                    .take(12)
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            };
-            dialog
-                .title(
-                    t!("app.update_title", version = release.version.clone()).to_string(),
-                )
-                .w(px(460.))
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap(px(8.))
-                        .child(
-                            div()
-                                .text_size(px(12.))
-                                .text_color(muted)
-                                .child(
-                                    t!(
-                                        "app.current_version",
-                                        version = env!("CARGO_PKG_VERSION")
-                                    )
-                                    .to_string(),
-                                ),
-                        )
-                        .child(div().text_size(px(12.)).child(notes)),
-                )
-                .footer(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .gap(px(8.))
-                        .child(
-                            Button::new("update-later")
-                                .label(t!("app.cancel").to_string())
-                                .on_click(|_, window, cx| window.close_dialog(cx)),
-                        )
-                        .child(
-                            Button::new("update-install")
-                                .primary()
-                                .label(t!("app.update_install").to_string())
-                                .on_click(move |_, window, cx| {
-                                    window.close_dialog(cx);
-                                    install.update(cx, |view, cx| view.install_update(window, cx));
-                                }),
-                        ),
-                )
-        });
-    }
-
-    /// 下载并交给安装器。安装器会结束本进程，所以成功路径上直接退出。
-    fn install_update(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(release) = self.update_release.clone() else {
-            return;
-        };
-        if self.update_busy {
-            return;
-        }
-        self.update_busy = true;
-        self.toast(
-            t!("app.update_downloading").to_string(),
-            NotificationType::Info,
-            window,
-            cx,
-        );
-
-        let this = cx.entity().clone();
-        cx.spawn_in(window, async move |_weak, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move { crate::services::update::download(&release) })
-                .await;
-            let _ = this.update_in(cx, |view, window, cx| {
-                view.update_busy = false;
-                match result.and_then(|path| crate::services::update::run_installer(&path)) {
-                    Ok(()) => {
-                        // 安装脚本会 taskkill 旧进程；主动退出让它安静地覆盖文件。
-                        log::info!("更新：已拉起安装器，退出当前进程");
-                        cx.quit();
-                    }
-                    Err(error) => view.show_error_dialog(
-                        t!("app.update_failed", error = error.to_string()).to_string(),
-                        window,
-                        cx,
-                    ),
-                }
-            });
-        })
-        .detach();
+    /// 检查更新：交给 `UpdateFlow`，它自己负责对话框里的进度与状态。
+    fn check_update(&mut self, manual: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.update
+            .update(cx, |flow, cx| flow.check(manual, window, cx));
     }
 
     /// 按设置里的主题档套用；「跟随系统」读窗口外观。
@@ -1432,6 +1667,7 @@ impl RootView {
         self.settings.general.autostart = *self.set_autostart.read(cx);
         self.settings.general.logging = *self.set_logging.read(cx);
         self.settings.sap.use_uuid = *self.set_uuid.read(cx);
+        self.settings.general.auto_check_update = *self.set_auto_check.read(cx);
         if let Err(error) = crate::platform::autostart::apply(self.settings.general.autostart) {
             log::warn!("设置开机自启失败：{error}");
         }
@@ -1506,14 +1742,14 @@ impl RootView {
             .unwrap_or_default();
         let this = cx.entity().clone();
 
-        window.open_dialog(cx, move |dialog, _window, cx| {
+        window.open_dialog(cx, move |dialog, window, cx| {
             let confirm = this.clone();
             dialog
                 .title(t!("app.delete_question", name = name).to_string())
-                .w(px(460.))
+                .w(dialog_width(window, 28.75))
                 .child(
                     div()
-                        .text_size(px(12.))
+                        .text_xs()
                         .text_color(cx.theme().muted_foreground)
                         .child(t!("app.delete_hint").to_string()),
                 )
@@ -1521,7 +1757,7 @@ impl RootView {
                     div()
                         .flex()
                         .flex_row()
-                        .gap(px(8.))
+                        .gap(rems(0.5))
                         .child(
                             Button::new("delete-cancel")
                                 .label(t!("app.cancel").to_string())
@@ -1638,15 +1874,15 @@ impl RootView {
         let this = cx.entity().clone();
         let input = self.alias_input.clone();
 
-        window.open_dialog(cx, move |dialog, _window, cx| {
+        window.open_dialog(cx, move |dialog, window, cx| {
             let confirm = this.clone();
             dialog
                 .title(t!("app.set_alias").to_string())
-                .w(px(420.))
+                .w(dialog_width(window, 26.25))
                 .child(
                     div()
-                        .pb(px(10.))
-                        .text_size(px(11.))
+                        .pb(rems(0.625))
+                        .text_size(rems(0.6875))
                         .text_color(cx.theme().muted_foreground)
                         .child(t!("app.alias_hint").to_string()),
                 )
@@ -1655,7 +1891,7 @@ impl RootView {
                     div()
                         .flex()
                         .flex_row()
-                        .gap(px(8.))
+                        .gap(rems(0.5))
                         .child(
                             Button::new("alias-cancel")
                                 .label(t!("app.cancel").to_string())
@@ -1694,20 +1930,20 @@ impl RootView {
 
     /// 启动进度弹框：Spinner + 说明，启动后由 login 里的定时器自动关闭。
     fn open_launching_dialog(&self, name: String, window: &mut Window, cx: &mut Context<Self>) {
-        window.open_dialog(cx, move |dialog, _window, cx| {
+        window.open_dialog(cx, move |dialog, window, cx| {
             dialog
                 .title(t!("app.launching", name = name).to_string())
-                .w(px(360.))
+                .w(dialog_width(window, 22.5))
                 .child(
                     div()
                         .flex()
                         .items_center()
-                        .gap(px(10.))
-                        .pb(px(6.))
+                        .gap(rems(0.625))
+                        .pb(rems(0.375))
                         .child(Spinner::new())
                         .child(
                             div()
-                                .text_size(px(12.))
+                                .text_xs()
                                 .text_color(cx.theme().muted_foreground)
                                 .child(t!("app.launching_hint").to_string()),
                         ),
@@ -1884,13 +2120,13 @@ impl RootView {
         let control = move |id: &'static str, area: WindowControlArea, glyph: &'static str| {
             div()
                 .id(id)
-                .w(px(34.))
-                .h(px(30.))
+                .w(rems(2.125))
+                .h(rems(1.875))
                 .flex()
                 .items_center()
                 .justify_center()
-                .rounded(px(6.))
-                .text_size(px(13.))
+                .rounded(rems(0.375))
+                .text_size(rems(0.8125))
                 .text_color(muted)
                 .hover(|style| style.bg(muted.opacity(0.12)))
                 .window_control_area(area)
@@ -1909,10 +2145,10 @@ impl RootView {
             .top_0()
             .left_0()
             .right_0()
-            .h(px(TITLE_BAR))
+            .h(rems(TITLE_BAR))
             .flex()
             .items_center()
-            .px(px(8.))
+            .px(rems(0.5))
             .child(
                 div()
                     .flex_1()
@@ -1935,10 +2171,11 @@ impl RootView {
                 )),
             )
             .child(
+                // 分隔线固定一设备像素：放大字号时它不该跟着变粗。
                 div()
                     .w(px(1.))
-                    .h(px(18.))
-                    .mx(px(6.))
+                    .h(rems(1.125))
+                    .mx(rems(0.375))
                     .bg(border),
             )
             .child(control("win-min", WindowControlArea::Min, "–"))
@@ -1947,13 +2184,13 @@ impl RootView {
                 // 关闭不退出进程：收进任务栏（托盘里仍可恢复），退出走托盘菜单。
                 div()
                     .id("win-close")
-                    .w(px(34.))
-                    .h(px(30.))
+                    .w(rems(2.125))
+                    .h(rems(1.875))
                     .flex()
                     .items_center()
                     .justify_center()
-                    .rounded(px(6.))
-                    .text_size(px(13.))
+                    .rounded(rems(0.375))
+                    .text_size(rems(0.8125))
                     .text_color(muted)
                     .hover(move |style| style.bg(muted.opacity(0.12)))
                     .occlude()
@@ -1963,7 +2200,7 @@ impl RootView {
                     }))
                     .child("✕"),
             )
-            .child(div().w(px(4.)))
+            .child(div().w(rems(0.25)))
     }
 
     fn begin_new_shortcut(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2160,13 +2397,13 @@ impl RootView {
     /// 新建快捷方式：标准 Dialog，下拉用 Select。
     /// 失败提示：用 Dialog 而不是只写状态栏，状态栏在弹框后面看不明显。
     fn show_error_dialog(&self, message: String, window: &mut Window, cx: &mut Context<Self>) {
-        window.open_dialog(cx, move |dialog, _window, cx| {
+        window.open_dialog(cx, move |dialog, window, cx| {
             dialog
                 .title(t!("app.error_title").to_string())
-                .w(px(420.))
+                .w(dialog_width(window, 26.25))
                 .child(
                     div()
-                        .text_size(px(12.))
+                        .text_xs()
                         .text_color(cx.theme().foreground)
                         .child(message.clone()),
                 )
@@ -2287,7 +2524,7 @@ impl RootView {
         let reuse = self.new_reuse.clone();
         let muted = cx.theme().muted_foreground;
 
-        window.open_dialog(cx, move |dialog, _window, cx| {
+        window.open_dialog(cx, move |dialog, window, cx| {
             let confirm = this.clone();
             let reuse_value = *reuse.read(cx);
             let reuse_click = reuse.clone();
@@ -2295,12 +2532,12 @@ impl RootView {
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(10.))
-                    .pb(px(10.))
+                    .gap(rems(0.625))
+                    .pb(rems(0.625))
                     .child(
                         div()
-                            .w(px(72.))
-                            .text_size(px(12.))
+                            .w(rems(4.5))
+                            .text_xs()
                             .text_color(muted)
                             .child(label),
                     )
@@ -2309,7 +2546,7 @@ impl RootView {
 
             dialog
                 .title(t!("app.new_shortcut").to_string())
-                .w(px(560.))
+                .w(dialog_width(window, 35.0))
                 .child(row(
                     t!("app.folder").to_string(),
                     Select::new(&folder_select).small().into_any_element(),
@@ -2340,7 +2577,7 @@ impl RootView {
                         let pick_this = this.clone();
                         div()
                             .flex()
-                            .gap(px(8.))
+                            .gap(rems(0.5))
                             .child(div().flex_1().child(Input::new(&workdir)))
                             .child(
                                 Button::new("pick-new-workdir")
@@ -2379,7 +2616,7 @@ impl RootView {
                     div()
                         .flex()
                         .flex_row()
-                        .gap(px(8.))
+                        .gap(rems(0.5))
                         .child(
                             Button::new("new-cancel")
                                 .label(t!("app.cancel").to_string())
@@ -2413,8 +2650,8 @@ impl RootView {
             .flex_col()
             .items_center()
             .justify_center()
-            .gap(px(10.))
-            .py(px(80.))
+            .gap(rems(0.625))
+            .py(rems(5.0))
             .w_full()
             .child(
                 Icon::new(IconName::Plus)
@@ -2423,13 +2660,13 @@ impl RootView {
             )
             .child(
                 div()
-                    .text_size(px(14.))
+                    .text_sm()
                     .text_color(cx.theme().foreground)
                     .child(t!("app.empty_title").to_string()),
             )
             .child(
                 div()
-                    .text_size(px(12.))
+                    .text_xs()
                     .text_color(muted)
                     .child(t!("app.empty_hint").to_string()),
             )
@@ -2449,10 +2686,10 @@ impl RootView {
         let mut content = div()
             .flex()
             .flex_col()
-            .gap(px(2.))
-            .pt(px(2.))
-            .px(px(14.))
-            .pb(px(40.))
+            .gap(rems(0.125))
+            .pt(rems(0.125))
+            .px(rems(0.875))
+            .pb(rems(2.5))
             .w_full();
 
         if let Some(landscape) = &self.landscape {
@@ -2597,8 +2834,8 @@ impl RootView {
 
         let card = div()
             .id(element_id("card", &uuid))
-            .w(px(200.))
-            .h(px(96.))
+            .w(rems(12.5))
+            .h(rems(6.0))
             .cursor_pointer()
             .flex()
             .flex_col()
@@ -2625,11 +2862,11 @@ impl RootView {
                         div()
                             .flex()
                             .items_center()
-                            .gap(px(6.))
+                            .gap(rems(0.375))
                             .child(
                                 div()
-                                    .w(px(6.))
-                                    .h(px(6.))
+                                    .w(rems(0.375))
+                                    .h(rems(0.375))
                                     .flex_shrink_0()
                                     .rounded_full()
                                     .bg(light),
@@ -2639,7 +2876,7 @@ impl RootView {
                                     .flex_1()
                                     .min_w_0()
                                     .truncate()
-                                    .text_size(px(14.))
+                                    .text_sm()
                                     .child(name),
                             )
                             .child(if pinned {
@@ -2654,7 +2891,7 @@ impl RootView {
                     .child(
                         div()
                             .truncate()
-                            .text_size(px(10.))
+                            .text_size(rems(0.625))
                             .text_color(muted)
                             .child(format!("{language} · {instance} · {host}")),
                     )
@@ -2662,13 +2899,13 @@ impl RootView {
                         div()
                             .flex()
                             .items_center()
-                            .gap(px(6.))
+                            .gap(rems(0.375))
                             .child(
                                 div()
                                     .flex_1()
                                     .min_w_0()
                                     .truncate()
-                                    .text_size(px(10.))
+                                    .text_size(rems(0.625))
                                     .text_color(muted)
                                     .child(user),
                             )
@@ -2850,24 +3087,24 @@ impl RootView {
         let username_input = self.username_input.clone();
         let password_input = self.password_input.clone();
 
-        window.open_dialog(cx, move |dialog, _window, cx| {
+        window.open_dialog(cx, move |dialog, window, cx| {
             let confirm = this.clone();
             dialog
                 .title(name.clone())
-                .w(px(420.))
+                .w(dialog_width(window, 26.25))
                 .child(
                     div()
-                        .text_size(px(12.))
+                        .text_xs()
                         .text_color(cx.theme().muted_foreground)
                         .child(t!("app.first_login_hint").to_string()),
                 )
-                .child(div().mt(px(8.)).child(Input::new(&username_input)))
-                .child(div().mt(px(8.)).child(Input::new(&password_input).mask_toggle()))
+                .child(div().mt(rems(0.5)).child(Input::new(&username_input)))
+                .child(div().mt(rems(0.5)).child(Input::new(&password_input).mask_toggle()))
                 .footer(
                     div()
                         .flex()
                         .flex_row()
-                        .gap(px(8.))
+                        .gap(rems(0.5))
                         .child(
                             Button::new("password-cancel")
                                 .label(t!("app.cancel").to_string())
@@ -3036,12 +3273,12 @@ fn soft_tag_colors(index: usize, dark: bool) -> (gpui_kit::Rgba, gpui_kit::Rgba)
 fn soft_tag(label: String, index: usize, dark: bool) -> impl IntoElement {
     let (background, foreground) = soft_tag_colors(index, dark);
     div()
-        .h(px(15.))
-        .px(px(5.))
-        .rounded(px(4.))
+        .h(rems(0.9375))
+        .px(rems(0.3125))
+        .rounded(rems(0.25))
         .bg(background)
         .text_color(foreground)
-        .text_size(px(9.5))
+        .text_size(rems(0.59375))
         .flex()
         .items_center()
         .child(label)
@@ -3049,14 +3286,30 @@ fn soft_tag(label: String, index: usize, dark: bool) -> impl IntoElement {
 
 fn section_title(name: &str, muted: Hsla) -> impl IntoElement {
     div()
-        .mt(px(16.))
-        .mb(px(8.))
-        .px(px(2.))
+        .mt(rems(1.0))
+        .mb(rems(0.5))
+        .px(rems(0.125))
         .child(
             Label::new(name.to_string())
-                .text_size(px(12.5))
+                .text_size(rems(0.78125))
                 .text_color(muted),
         )
+}
+
+/// 对话框宽度。`Dialog::w` 只收 `Pixels`，这里按当前 rem 折算，让它跟着基准字号缩放。
+fn dialog_width(window: &Window, rem: f32) -> Pixels {
+    window.rem_size() * rem
+}
+
+/// 进度文案：已下载 / 总大小，按 MB 显示。总长未知时只说已下载多少。
+fn progress_text(received: u64, total: Option<u64>) -> String {
+    fn mb(bytes: u64) -> String {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    }
+    match total {
+        Some(total) => t!("app.update_progress", done = mb(received), total = mb(total)).to_string(),
+        None => mb(received),
+    }
 }
 
 /// 设置里的材质名 → 窗口背景外观。Mica 只有 Win11 有，老系统上按不透明处理。
@@ -3101,7 +3354,7 @@ fn card_grid(cards: Vec<AnyElement>) -> impl IntoElement {
         .flex()
         .flex_wrap()
         .justify_start()
-        .gap(px(10.))
+        .gap(rems(0.625))
         .children(cards)
 }
 

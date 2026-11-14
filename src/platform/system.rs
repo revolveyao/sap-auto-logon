@@ -175,3 +175,48 @@ fn saplogon_version() -> Option<u32> {
 fn saplogon_version() -> Option<u32> {
     None
 }
+
+/// 系统代理，`None` = 没有启用或没配。
+///
+/// 公司网络里 GitHub 基本只能从代理出去；`ureq` 只认显式给定的代理，不会去读
+/// 「Internet 选项」，所以这里自己把系统设置读出来交给它。
+///
+/// `ProxyServer` 有两种写法：`host:port`，以及按协议分开的
+/// `http=h:1;https=h:2`。HTTPS 目标走的是 CONNECT，用的是 http 那一项。
+#[cfg(target_os = "windows")]
+pub fn system_proxy() -> Option<String> {
+    let key = windows_registry::CURRENT_USER
+        .open(r"Software\Microsoft\Windows\CurrentVersion\Internet Settings")
+        .ok()?;
+    if key.get_u32("ProxyEnable").ok()? != 1 {
+        return None;
+    }
+    let server = key.get_string("ProxyServer").ok()?;
+
+    let server = server.trim();
+    // 按协议的写法里找 `http=` 那一项；顺序不固定，不能只看第一个键值对。
+    let host = server
+        .split(';')
+        .filter_map(|part| part.split_once('='))
+        .find(|(name, _)| name.trim().eq_ignore_ascii_case("http"))
+        .map(|(_, value)| value.trim())
+        .or_else(|| {
+            server
+                .split(';')
+                .map(str::trim)
+                .find(|part| !part.is_empty() && !part.contains('='))
+        })?;
+    if host.is_empty() {
+        return None;
+    }
+    if host.contains("://") {
+        Some(host.to_string())
+    } else {
+        Some(format!("http://{host}"))
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn system_proxy() -> Option<String> {
+    None
+}

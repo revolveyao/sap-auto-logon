@@ -297,6 +297,21 @@ app:
   update_no_notes:
     en: "No release notes for this version."
     zh-CN: "该版本没有更新说明。"
+  update_section:
+    en: "Updates"
+    zh-CN: "更新"
+  auto_check_update:
+    en: "Check for updates on startup"
+    zh-CN: "启动时检查新版本"
+  update_install_now:
+    en: "Install now"
+    zh-CN: "立即安装"
+  update_ready:
+    en: "The installer is ready. Installing closes the app and relaunches the new version."
+    zh-CN: "安装包已就绪。安装会关闭当前程序，并启动新版本。"
+  update_progress:
+    en: "%{done} of %{total}"
+    zh-CN: "已下载 %{done} / %{total}"
   current_version:
     en: "Current version: %{version}"
     zh-CN: "当前版本：%{version}"
