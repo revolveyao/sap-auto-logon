@@ -34,6 +34,14 @@ fn main() {
     let settings = core::settings::AppSettings::load();
     log::info!("SAP Auto Logon {} starting", env!("CARGO_PKG_VERSION"));
 
+    // 装好的旧包不会再被安装，启动时清一次：一个安装包五兆上下，攒几版就是白占地方。
+    // 比当前版本新的包会留着——那可能是上次「取消安装」留下的，下次直接复用。
+    match services::update::prune_stale_setups(env!("CARGO_PKG_VERSION")) {
+        Ok(0) => {}
+        Ok(removed) => log::info!("清理过期安装包：{removed} 个"),
+        Err(error) => log::warn!("清理过期安装包失败：{error}"),
+    }
+
     // 配置与注册表可能不一致（搬过目录），启动时对齐一次。
     if let Err(error) = platform::autostart::apply(settings.general.autostart) {
         log::warn!("对齐开机自启失败：{error}");

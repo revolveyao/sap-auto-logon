@@ -77,6 +77,44 @@ pub fn cached_setup(release: &Release) -> Option<PathBuf> {
     (size >= MIN_SETUP_SIZE).then_some(path)
 }
 
+/// 清掉已经不可能再安装的安装包，返回删除个数。
+///
+/// 版本号不高于当前运行版本的包永远装不上了：升级只会往前走，而 `cached_setup`
+/// 只认正在检查的那个版本。留着每个都是几兆到几十兆。比当前版本**新**的包可能是
+/// 上次「取消安装」留下的，必须保留——下次检查更新能直接复用，不必重下。
+///
+/// 顺带清掉下载中断留下的 `.part`：那些文件永远不会被改名成正式包。
+pub fn prune_stale_setups(current: &str) -> std::io::Result<usize> {
+    let Ok(entries) = std::fs::read_dir(updates_dir()) else {
+        // 目录还不存在，说明从没下载过安装包。
+        return Ok(0);
+    };
+
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let stale = if name.starts_with("SAP-Auto-Logon-") && name.ends_with("-setup.exe.part") {
+            true
+        } else {
+            // 只认自己命名的正式包，用户放进这个目录的别的东西不动。
+            name.strip_prefix("SAP-Auto-Logon-")
+                .and_then(|rest| rest.strip_suffix("-setup.exe"))
+                .filter(|version| {
+                    !version.is_empty()
+                        && version.chars().all(|c| c.is_ascii_digit() || c == '.')
+                })
+                .is_some_and(|version| !is_newer(version, current))
+        };
+        if stale && std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
 /// 下载安装包，走系统代理（如果系统启用了）。
 ///
 /// `on_progress` 在下载线程上被调用：(已收字节, 总字节)。总长未知时第二项为 `None`
