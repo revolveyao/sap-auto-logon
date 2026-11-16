@@ -20,15 +20,16 @@ pub struct XmlNode {
 impl XmlNode {
     fn parse(text: &str) -> anyhow::Result<Self> {
         let document = roxmltree::Document::parse(text)?;
-        Ok(Self::from_node(document.root_element()))
+        Self::from_node(document.root_element(), text)
     }
 
-    fn from_node(node: Node<'_, '_>) -> Self {
+    /// `source` 是原始文档：属性名要按源码切片取，见下面「限定名」的说明。
+    fn from_node(node: Node<'_, '_>, source: &str) -> anyhow::Result<Self> {
         let mut children = Vec::new();
         let mut text = None;
         for child in node.children() {
             if child.is_element() {
-                children.push(Self::from_node(child));
+                children.push(Self::from_node(child, source)?);
             } else if child.is_text() {
                 let value = child.text().unwrap_or_default().trim().to_string();
                 if !value.is_empty() {
@@ -36,15 +37,28 @@ impl XmlNode {
                 }
             }
         }
-        Self {
+        let mut attrs = Vec::new();
+        for attr in node.attributes() {
+            // 必须写回限定名（含前缀），不能用 attr.name()：它只给本地名，
+            // SAP GUI 写的 `xml:space="preserve"` 会塌成 `space="preserve"`，
+            // 与该元素上 SAP 自己的 `space="preserve"` 撞成重复属性，
+            // 整份 Landscape 变成非法 XML —— SAP GUI 与工具自己都再也读不了。
+            let range = attr.range_qname();
+            let Some(name) = source.get(range.clone()).filter(|name| !name.is_empty()) else {
+                return Err(anyhow::anyhow!(
+                    "属性 {} 的限定名无法从源码还原（range={range:?}，源码 {} 字节）",
+                    attr.name(),
+                    source.len()
+                ));
+            };
+            attrs.push((name.to_string(), attr.value().to_string()));
+        }
+        Ok(Self {
             tag: node.tag_name().name().to_string(),
-            attrs: node
-                .attributes()
-                .map(|attr| (attr.name().to_string(), attr.value().to_string()))
-                .collect(),
+            attrs,
             children,
             text,
-        }
+        })
     }
 
     fn serialize(&self, out: &mut String, depth: usize) {
@@ -324,6 +338,13 @@ fn prune_backups(dir: &Path, keep: usize) {
 }
 
 pub fn save_atomic(source: &Path, text: &str) -> anyhow::Result<PathBuf> {
+    // 写出去的东西必须先能解析回来。序列化只要有一点差错，SAP 唯一的那份
+    // Landscape 就会被覆盖成非法 XML（2026-11-16 因属性名塌陷坏过一次），
+    // 所以这里宁可报错，也绝不落下这个文件。
+    roxmltree::Document::parse(text).map_err(|error| {
+        anyhow::anyhow!("生成的 XML 自检失败，已中止写回（原文件未改动）：{error}")
+    })?;
+
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
     let dir = backup_dir();
     std::fs::create_dir_all(&dir)?;
