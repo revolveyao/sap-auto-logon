@@ -8,7 +8,9 @@ static CACHED: std::sync::Mutex<Option<isize>> = std::sync::Mutex::new(None);
 
 #[cfg(target_os = "windows")]
 fn find_window() -> Option<windows_sys::Win32::Foundation::HWND> {
-    use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM};
+    use windows_sys::Win32::Foundation::{HWND, LPARAM};
+    // windows-sys 0.61 把 `BOOL` 挪到了 crate 根：`Win32::Foundation` 里已经没有它。
+    use windows_sys::core::BOOL;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         EnumWindows, GetClassNameW, GetWindowTextLengthW, GetWindowThreadProcessId,
         IsWindowVisible,

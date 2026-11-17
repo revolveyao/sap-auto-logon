@@ -1,7 +1,11 @@
-//! 系统托盘：图标、菜单与事件轮询。
-//! 系统托盘：图标、菜单与事件轮询。
+//! 系统托盘：图标、菜单与事件通道。
 //!
-//! `tray-icon` 把事件投递到全局通道，轮询在 UI 线程完成，因此窗口状态仍是单线程的。
+//! `tray-icon` / `muda` 的事件走 `set_event_handler` 注册的全局回调，回调在托盘
+//! 图标自己的窗口过程里同步执行（Windows 上就是主线程的消息泵）。回调里没有
+//! `&mut App`，所以它只把事件丢进通道（[`install_event_handlers`]），由 gpui 的
+//! 任务在主线程取走、转换成 [`TrayAction`]。
+
+use std::sync::OnceLock;
 
 use rust_i18n::t;
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
@@ -15,6 +19,38 @@ pub enum TrayAction {
     /// 打开设置
     Settings,
     Quit,
+}
+
+/// 托盘上发生的事，由库的回调在消息宿主线程上投递进来。
+pub enum TrayEvent {
+    Menu(tray_icon::menu::MenuId),
+    Icon(TrayIconEvent),
+}
+
+/// 事件投递端。`set_event_handler` 是进程级注册、只能设一次，所以发送端放在
+/// 全局而不是 [`Tray`] 上 —— 它与具体哪一个托盘实例无关。
+static TRAY_EVENTS: OnceLock<async_channel::Sender<TrayEvent>> = OnceLock::new();
+static TRAY_INBOX: OnceLock<async_channel::Receiver<TrayEvent>> = OnceLock::new();
+
+/// 注册全局托盘事件回调（进程内只生效一次），返回主线程消费的接收端。
+pub fn install_event_handlers() -> async_channel::Receiver<TrayEvent> {
+    TRAY_INBOX
+        .get_or_init(|| {
+            let (tx, rx) = async_channel::unbounded();
+            let _ = TRAY_EVENTS.set(tx);
+            TrayIconEvent::set_event_handler(Some(|event| {
+                if let Some(tx) = TRAY_EVENTS.get() {
+                    let _ = tx.try_send(TrayEvent::Icon(event));
+                }
+            }));
+            MenuEvent::set_event_handler(Some(|event: tray_icon::menu::MenuEvent| {
+                if let Some(tx) = TRAY_EVENTS.get() {
+                    let _ = tx.try_send(TrayEvent::Menu(event.id));
+                }
+            }));
+            rx
+        })
+        .clone()
 }
 
 pub struct Tray {
@@ -66,32 +102,25 @@ impl Tray {
         })
     }
 
-    /// 排空待处理事件，返回第一个识别出的动作。
-    pub fn poll(&self) -> Option<TrayAction> {
-        let mut action = None;
-
-        while let Ok(event) = TrayIconEvent::receiver().try_recv() {
-            if matches!(event, TrayIconEvent::DoubleClick { .. }) && action.is_none() {
-                action = Some(TrayAction::ShowWindow);
-            }
+    /// 把一个托盘事件翻译成动作；认不出的返回 `None`。
+    pub fn action_for_event(&self, event: &TrayEvent) -> Option<TrayAction> {
+        match event {
+            TrayEvent::Menu(id) => self.action_for_menu(id),
+            TrayEvent::Icon(event) => matches!(event, TrayIconEvent::DoubleClick { .. })
+                .then_some(TrayAction::ShowWindow),
         }
+    }
 
-        while let Ok(event) = MenuEvent::receiver().try_recv() {
-            let recognised = if event.id == self.show_id {
-                Some(TrayAction::ShowWindow)
-            } else if event.id == self.settings_id {
-                Some(TrayAction::Settings)
-            } else if event.id == self.quit_id {
-                Some(TrayAction::Quit)
-            } else {
-                None
-            };
-            if action.is_none() {
-                action = recognised;
-            }
+    fn action_for_menu(&self, id: &tray_icon::menu::MenuId) -> Option<TrayAction> {
+        if *id == self.show_id {
+            Some(TrayAction::ShowWindow)
+        } else if *id == self.settings_id {
+            Some(TrayAction::Settings)
+        } else if *id == self.quit_id {
+            Some(TrayAction::Quit)
+        } else {
+            None
         }
-
-        action
     }
 }
 

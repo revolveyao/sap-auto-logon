@@ -1,6 +1,6 @@
 [package]
 name = "sap-auto-logon"
-version = "0.2.10"
+version = "0.2.11"
 edition = "2021"
 description = "SAP Auto Logon"
 license = "MIT"
@@ -9,7 +9,7 @@ build = "build.rs"
 [dependencies]
 # 唯一框架依赖。gpui-pre + gpui-base + gpui-component + gpui-kit-assets 由它引入，
 # 不要再单独声明 `gpui` / `gpui-component`：那会编出两套 GPUI，Entity 传不过去。
-gpui-kit = "0.9.1"
+gpui-kit = "0.10.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
@@ -27,13 +27,15 @@ ureq = { version = "2", default-features = false, features = ["tls", "gzip"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-tray-icon = "0.19"
+tray-icon = "0.26"
+# 托盘事件从回调线程投递到 gpui 主线程的通道。
+async-channel = "2"
 winreg = "0.56"
 windows-registry = "0.5"
 # 凭据管理器（CredWriteW / CredReadW / CredDeleteW）与单实例互斥体。
 # `Win32_Security_Credentials` 是 Cred* 的归属模块；缺它那两个函数不会出现在
 # 绑定里，报错是「找不到名字」，看不出与 feature 有关。
-windows-sys = { version = "0.59", features = [
+windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Credentials",

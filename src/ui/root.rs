@@ -787,7 +787,7 @@ impl RootView {
         )
         .detach();
 
-        view.start_tray_poll(window, cx);
+        view.start_tray_events(window, cx);
 
         // 启动后查一次新版本：等窗口先画出来再查，不和启动抢带宽。
         // 没有新版本、或者根本没网，都保持安静——开机弹一句「已经是最新」是噪音。
@@ -805,17 +805,19 @@ impl RootView {
         view
     }
 
-    /// 托盘事件轮询：菜单点击投递到全局通道，这里在 UI 线程排空。
-    /// 用 spawn（不绑定窗口）：窗口收进托盘后轮询必须继续跑。
-    fn start_tray_poll(&self, _window: &mut Window, cx: &mut Context<Self>) {
+    /// 托盘事件：库的回调把它们投递进通道，这里在主线程取走并执行。
+    /// 用 spawn（不绑定窗口）：窗口收进托盘后这条通道必须继续活着。
+    fn start_tray_events(&self, _window: &mut Window, cx: &mut Context<Self>) {
         let this = cx.entity().clone();
+        let events = crate::platform::tray::install_event_handlers();
         cx.spawn(async move |_weak_view, cx| loop {
-            cx.background_executor()
-                .timer(std::time::Duration::from_millis(200))
-                .await;
-
+            let Ok(event) = events.recv().await else {
+                break;
+            };
+            // 与原先「一次只执行一个动作」一致：积压的事件丢掉。
+            while events.try_recv().is_ok() {}
             let action =
-                cx.update(|cx| this.update(cx, |view, cx| view.poll_tray(cx)));
+                cx.update(|cx| this.update(cx, |view, _cx| view.action_for_event(&event)));
             let Some(action) = action else {
                 continue;
             };
@@ -861,8 +863,11 @@ impl RootView {
             }
         })
         .detach();
-    }    fn poll_tray(&self, _cx: &mut Context<Self>) -> Option<crate::platform::tray::TrayAction> {
-        self.tray.as_ref().and_then(|tray| tray.poll())
+    }    fn action_for_event(
+        &self,
+        event: &crate::platform::tray::TrayEvent,
+    ) -> Option<crate::platform::tray::TrayAction> {
+        self.tray.as_ref().and_then(|tray| tray.action_for_event(event))
     }
 
     fn reload(&mut self, cx: &mut Context<Self>) {
