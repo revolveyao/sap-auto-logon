@@ -3,7 +3,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-use gpui_kit::base::InteractiveElementExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -26,6 +25,9 @@ use crate::ui::card::Card;
 
 /// 顶栏高度，单位 rem（1 rem = 主题基准字号）。
 const TITLE_BAR: f32 = 2.5;
+
+/// 连点两下算双击的时间窗。比系统默认的 500ms 略宽，手慢也能连上。
+const DOUBLE_CLICK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(600);
 
 /// 更新对话框处在哪一步。对话框按它换内容：等决定、等下载、等确认安装，
 /// 每一步都只有一个主操作，用户不用猜现在发生了什么。
@@ -375,6 +377,8 @@ struct NewShortcut {
 
 pub struct RootView {
     settings: AppSettings,
+    /// 主题库（每套主题一个文件）与当前正在使用的那套。
+    book: crate::core::colors::ThemeBook,
     landscape: Option<Landscape>,
     tray: Option<crate::platform::tray::Tray>,
     selected: Option<String>,
@@ -393,6 +397,8 @@ pub struct RootView {
     folder_picker_edit: bool,
     /// 选中计数：每次选中自增，旧的自动清除定时器据此判断是否过期
     select_generation: u64,
+    /// 上一次点击的卡片与时刻。双击登录靠它判定，见 `click_card`。
+    last_click: Option<(String, std::time::Instant)>,
     /// 本次运行里每个快捷方式上次登录的结果：true 成功 / false 失败
     last_result: HashMap<String, bool>,
     /// 正在等待输入密码的快捷方式 uuid；Some 时显示密码弹框
@@ -485,6 +491,8 @@ impl RootView {
         let set_logging = cx.new(|_| settings.general.logging);
         let set_uuid = cx.new(|_| settings.sap.use_uuid);
         let set_auto_check = cx.new(|_| settings.general.auto_check_update);
+        // 先把想要的主题 id 取出来：settings 随后会被移进视图。
+        let preferred_theme = settings.general.theme_id.clone();
         let update = cx.new(|_| UpdateFlow::new());
         let new_folder_select = cx.new(|cx| SelectState::new(Vec::<String>::new(), None, window, cx));
         let new_base_select = cx.new(|cx| SelectState::new(Vec::<String>::new(), None, window, cx));
@@ -581,6 +589,7 @@ impl RootView {
             cred_rx: None,
             folder_picker_edit: false,
             select_generation: 0,
+            last_click: None,
             last_result: HashMap::new(),
             password_target: None,
             settings_target: false,
@@ -622,13 +631,22 @@ impl RootView {
             username_input: username_input.clone(),
             password_input: password_input.clone(),
             remember: true,
+            book: {
+                let mut book = crate::core::colors::ThemeBook::load(&preferred_theme);
+                book.migrate_legacy();
+                book.seed_presets();
+                book
+            },
             update,
             set_auto_check,
         };
         view.reload(cx);
 
         // 把已经开着的 SAP 会话窗口的任务栏图标按系统标识换掉。
-        crate::platform::taskbar::apply_session_icons();
+        crate::platform::taskbar::apply_session_icons(
+            cx.theme().is_dark(),
+            &view.settings.roles,
+        );
 
         // 材质是否真的落到 DWM 上，肉眼判断不可靠：启动时读回一次记进日志。
         log::info!(
@@ -654,7 +672,7 @@ impl RootView {
             window,
             |this, _state, event: &InputEvent, window, cx| {
                 if matches!(event, InputEvent::PressEnter { .. }) {
-                    this.login(window, cx);
+                    this.submit_credentials(window, cx);
                 }
             },
         )
@@ -664,7 +682,7 @@ impl RootView {
             window,
             |this, _state, event: &InputEvent, window, cx| {
                 if matches!(event, InputEvent::PressEnter { .. }) {
-                    this.login(window, cx);
+                    this.submit_credentials(window, cx);
                 }
             },
         )
@@ -1049,6 +1067,32 @@ impl RootView {
         cx.notify();
     }
 
+    /// 卡片的点击：先选中；同一张卡在双击窗内再点一次就直接登录。
+    ///
+    /// 不用 gpui 的 `on_double_click`：它按系统双击矩形判定（`SM_CXDOUBLECLK`，
+    /// 默认每边 4 像素），两次点击之间手一抖就落空——两次明明都落在同一张卡上，
+    /// 却只有第一次被当成单击，表现出来就是「双击经常没反应，右键反而能登录」。
+    fn click_card(&mut self, service_id: String, window: &mut Window, cx: &mut Context<Self>) {
+        let now = std::time::Instant::now();
+        let double = self.last_click.as_ref().is_some_and(|(last, at)| {
+            last == &service_id && now.duration_since(*at) <= DOUBLE_CLICK_INTERVAL
+        });
+        self.last_click = Some((service_id.clone(), now));
+        self.select(service_id.clone(), window, cx);
+        if double {
+            // 清掉记录，免得三连击再触发一次登录。
+            self.last_click = None;
+            self.login_service(service_id, window, cx);
+        }
+    }
+
+    /// 改状态栏提示并重画。直接写 `self.status` 不通知的话，提示在屏幕上不会出现，
+    /// 失败看起来就是「点了没反应」。
+    fn set_status(&mut self, message: String, cx: &mut Context<Self>) {
+        self.status = message;
+        cx.notify();
+    }
+
     fn remember_recent(&mut self, service_id: &str) {
         let mut recent = self.settings.window.recent.clone();
         recent.retain(|id| id != service_id);
@@ -1291,6 +1335,7 @@ impl RootView {
                     div()
                         .flex()
                         .flex_row()
+                        .flex_wrap()
                         .gap(rems(0.5))
                         .child(
                             Button::new("edit-cancel")
@@ -1385,6 +1430,755 @@ impl RootView {
         self.open_settings_dialog(window, cx);
     }
 
+    /// 主题配色。
+    ///
+    /// 左边是主题库（可滚动列表，每行带三色预览），右边是这套主题的名称与 28 个色号
+    /// （同样可滚动，两栏各自独立滚动）。
+    fn open_theme_dialog(&self, window: &mut Window, cx: &mut Context<Self>) {
+        use gpui_kit::component::color_picker::{ColorPicker, ColorPickerState};
+
+
+        let start = self.book.current_id().to_string();
+        let Some(theme) = self.book.find(&start).cloned() else {
+            return;
+        };
+
+        // 每种模式 28 个槽：6 组循环色 ×(底/字) + 4 个角色色 ×(底/字)
+        // + 卡片 7 色 + 窗口底色。
+        const PER_MODE: usize = 28;
+        let mut pickers: Vec<Entity<ColorPickerState>> = Vec::with_capacity(PER_MODE * 2);
+        for hex in color_slots(&theme.colors) {
+            let color: gpui_kit::Hsla = crate::core::colors::rgba(&hex).into();
+            pickers.push(cx.new(|cx| ColorPickerState::new(window, cx).default_value(color)));
+        }
+        let pickers = std::rc::Rc::new(pickers);
+        // 派生用的基色选择器必须独立：复用一个色号槽会让同一个 ColorPickerState
+        // 在同一帧出现两次，gpui 的 a11y 树会因为节点 id 重复直接 panic。
+        let hue_start: gpui_kit::Hsla = crate::core::colors::rgba(
+            theme
+                .colors
+                .derive_base
+                .as_deref()
+                .unwrap_or(&theme.colors.light.card.selected_background),
+        )
+        .into();
+        let hue_state = cx.new(|cx| ColorPickerState::new(window, cx).default_value(hue_start));
+
+        let editing = cx.new(|_| start);
+        let name_state = cx.new(|cx| {
+            InputState::new(window, cx).default_value(theme.name.clone())
+        });
+        let left_scroll = gpui_kit::ScrollHandle::new();
+        let right_scroll = gpui_kit::ScrollHandle::new();
+        let dark_tab = cx.new(|_| false);
+        let this = cx.entity().clone();
+        window.open_dialog(cx, move |dialog, _window, cx| {
+            let left_scroll = left_scroll.clone();
+            let right_scroll = right_scroll.clone();
+            let dark = *dark_tab.read(cx);
+            let muted = cx.theme().muted_foreground;
+            let base = if dark { PER_MODE } else { 0 };
+            let editing_id = editing.read(cx).clone();
+            let current = this.read(cx).book.find(&editing_id).cloned();
+            let read_only = current.as_ref().map(|theme| theme.builtin).unwrap_or(true);
+            let name = current
+                .as_ref()
+                .map(|theme| theme.name.clone())
+                .unwrap_or_default();
+
+            let save_this = this.clone();
+            let reset_this = this.clone();
+            let new_this = this.clone();
+            let import_this = this.clone();
+            let export_this = this.clone();
+            let delete_this = this.clone();
+            let switch_view = this.clone();
+            let save_pickers = pickers.clone();
+            let switch_pickers = pickers.clone();
+            let s_new = (this.clone(), pickers.clone(), editing.clone(), name_state.clone(), hue_state.clone());
+            let s_import = (this.clone(), pickers.clone(), editing.clone(), name_state.clone(), hue_state.clone());
+            let s_reset = (this.clone(), pickers.clone(), editing.clone(), name_state.clone(), hue_state.clone());
+            let s_delete = (this.clone(), pickers.clone(), editing.clone(), name_state.clone(), hue_state.clone());
+            let save_name = name_state.clone();
+            let save_hue = hue_state.clone();
+            let apply_this = this.clone();
+            let id_for_apply = editing_id.clone();
+            let editing_state = editing.clone();
+            let id_for_delete = editing_id.clone();
+            let id_for_export = editing_id.clone();
+            let id_for_save = editing_id.clone();
+
+            let label = |text: String| {
+                div()
+                    .w(rems(5.0))
+                    .text_size(rems(0.75))
+                    .text_color(muted)
+                    .child(text)
+            };
+            let tab = |text: String, value: bool, id: &'static str| {
+                let state = dark_tab.clone();
+                let button = Button::new(id).small().label(text);
+                let button = if dark == value { button.primary() } else { button };
+                button.on_click(move |_, _window, cx| {
+                    state.update(cx, |flag, cx| {
+                        *flag = value;
+                        cx.notify();
+                    });
+                })
+            };
+            // 一个色槽：只读主题显示静态色块，可改主题给选择器。
+            // 只读主题也用同一个组件渲染：外观与可编辑时完全一致。
+            // （内置主题的写入在保存时被拦住，不靠改渲染来区分。）
+            let slot = |index: usize| {
+                ColorPicker::new(&pickers[index]).w(rems(3.5))
+            };
+
+
+            // 主题库：左栏竖排列表，每行「三色预览条 + 名称」。
+            let mut library = div()
+                .id("theme-library")
+                .flex()
+                .track_scroll(&left_scroll)
+                .overflow_y_scroll()
+                .flex_col()
+                .gap(rems(0.25))
+                ;
+            for theme in this.read(cx).book.themes() {
+                let id = theme.id.clone();
+                let highlight = theme.id == editing_id;
+                let in_use = theme.id == this.read(cx).book.current_id();
+                let preview = {
+                    let palette = theme.colors.palette(dark);
+                    let card = crate::core::colors::rgba(&palette.card.background);
+                    let selected = crate::core::colors::rgba(&palette.card.selected_background);
+                    let role = crate::core::colors::rgba(&palette.role.dev.fg);
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap(rems(0.125))
+                        .child(div().w(rems(0.5)).h(rems(1.125)).rounded(rems(0.125)).bg(card))
+                        .child(div().w(rems(0.5)).h(rems(1.125)).rounded(rems(0.125)).bg(selected))
+                        .child(div().w(rems(0.5)).h(rems(1.125)).rounded(rems(0.125)).bg(role))
+                };
+                let mut row = div()
+                    .id(format!("theme-row-{}", theme.id))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(rems(0.5))
+                    .px(rems(0.375))
+                    .py(rems(0.25))
+                    .rounded(rems(0.25))
+                    .cursor_pointer()
+                    .child(preview)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(rems(0.875))
+                            .child(theme.name.clone()),
+                    );
+                if in_use {
+                    row = row.child(div().text_size(rems(0.75)).text_color(muted).child("●"));
+                }
+                if theme.builtin {
+                    row = row.child(div().text_size(rems(0.75)).child("🔒"));
+                }
+                if highlight {
+                    row = row.bg(muted.opacity(0.16));
+                }
+                let target = id.clone();
+                let editing_slot = editing_state.clone();
+                let switch_view = switch_view.clone();
+                let switch_pickers = switch_pickers.clone();
+                let name_for_row = name_state.clone();
+                let hue_for_row = hue_state.clone();
+                library = library.child(row.on_click(move |_, window, cx| {
+                    let Some(colors) = switch_view
+                        .read(cx)
+                        .book
+                        .find(&target)
+                        .map(|theme| theme.colors.clone())
+                    else {
+                        return;
+                    };
+                    let name = switch_view
+                        .read(cx)
+                        .book
+                        .find(&target)
+                        .map(|theme| theme.name.clone())
+                        .unwrap_or_default();
+                    for (index, hex) in color_slots(&colors).iter().enumerate() {
+                        if let Some(picker) = switch_pickers.get(index) {
+                            let color: gpui_kit::Hsla = crate::core::colors::rgba(hex).into();
+                            picker.update(cx, |state, cx| state.set_value(color, window, cx));
+                        }
+                    }
+                    name_for_row.update(cx, |state, cx| state.set_value(name, window, cx));
+                    let base_hex = colors
+                        .derive_base
+                        .clone()
+                        .unwrap_or_else(|| colors.light.card.selected_background.clone());
+                    let base_color: gpui_kit::Hsla =
+                        crate::core::colors::rgba(&base_hex).into();
+                    hue_for_row.update(cx, |state, cx| state.set_value(base_color, window, cx));
+                    let target = target.clone();
+                    editing_slot.update(cx, |slot, cx| {
+                        *slot = target;
+                        cx.notify();
+                    });
+                    switch_view.update(cx, |_, cx| cx.notify());
+                }));
+            }
+
+            // 左栏：主题库列表 + 底部操作。
+            let left = div()
+                .w(rems(13.0))
+                .h(rems(34.0))
+                .flex_shrink_0()
+                .flex()
+                .flex_col()
+                .gap(rems(0.25))
+                .pr(rems(0.75))
+                .border_r_1()
+                .border_color(muted.opacity(0.25))
+                .child(
+                    div()
+                        .text_size(rems(0.6875))
+                        .text_color(muted)
+                        .child(t!("app.theme_library").to_string()),
+                )
+                .child(library);
+
+            // 右栏：名称、浅深、派生、色号（独立滚动）。
+            let mut right = div()
+                .id("theme-details")
+                .track_scroll(&right_scroll)
+                .overflow_y_scroll()
+                .w(rems(27.0))
+                .flex_shrink_0()
+                .h(rems(34.0))
+                .pl(rems(0.75))
+                .flex()
+                .flex_col()
+                .gap(rems(0.5))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(rems(0.5))
+                        .child(label(t!("app.theme_name").to_string()))
+                        .child(
+                            div().flex_1().min_w_0().child(if read_only {
+                                div()
+                                    .text_size(rems(0.8125))
+                                    .child(format!(
+                                        "{}（{}）",
+                                        name,
+                                        t!("app.theme_builtin").to_string()
+                                    ))
+                                    .into_any_element()
+                            } else {
+                                Input::new(&name_state).into_any_element()
+                            }),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap(rems(0.5))
+                        .child(tab(t!("app.theme_light").to_string(), false, "theme-tab-light"))
+                        .child(tab(t!("app.theme_dark").to_string(), true, "theme-tab-dark")),
+                );
+
+            // 派生：给一个基色，按其色相**覆盖当前主题**的整套配色（不新建、不落盘，
+            // 点「保存」才写文件）。
+            if !read_only {
+                let hue_picker = hue_state.clone();
+                let derive_pickers = pickers.clone();
+                let derive_view = this.clone();
+                right = right.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(rems(0.5))
+                        .child(label(t!("app.theme_derive").to_string()))
+                        .child(ColorPicker::new(&hue_picker).w(rems(3.5)))
+                        .child(
+                            Button::new("theme-derive")
+                                .small()
+                                .label(t!("app.theme_derive_run").to_string())
+                                .on_click(move |_, window, cx| {
+                                    let Some(color) = hue_picker.read(cx).value() else {
+                                        return;
+                                    };
+                                    let rgba = gpui_kit::Rgba::from(color);
+                                    let hue = crate::core::colors::hue_from_rgb(
+                                        rgba.r, rgba.g, rgba.b,
+                                    );
+                                    let colors = crate::core::colors::derive_from_color(hue);
+                                    for (index, hex) in color_slots(&colors).iter().enumerate() {
+                                        if let Some(picker) = derive_pickers.get(index) {
+                                            let value: gpui_kit::Hsla =
+                                                crate::core::colors::rgba(hex).into();
+                                            picker.update(cx, |state, cx| {
+                                                state.set_value(value, window, cx)
+                                            });
+                                        }
+                                    }
+                                    derive_view.update(cx, |_, cx| cx.notify());
+                                }),
+                        ),
+                );
+            }
+
+            // 表头：说明每行两个色块分别是底色和文字色。
+            right = right.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(rems(0.5))
+                    .child(div().w(rems(5.0)))
+                    .child(
+                        div()
+                            .w(rems(3.5))
+                            .text_size(rems(0.625))
+                            .text_color(muted)
+                            .child(t!("app.color_bg").to_string()),
+                    )
+                    .child(
+                        div()
+                            .w(rems(3.5))
+                            .text_size(rems(0.625))
+                            .text_color(muted)
+                            .child(t!("app.color_fg").to_string()),
+                    ),
+            );
+
+            for index in 0..6 {
+                right = right.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(rems(0.5))
+                        .child(label(t!("app.client_color", index = index + 1).to_string()))
+                        .child(slot(base + index * 2))
+                        .child(slot(base + index * 2 + 1)),
+                );
+            }
+            for (offset, name) in [
+                t!("app.role_dev").to_string(),
+                t!("app.role_qas").to_string(),
+                t!("app.role_prd").to_string(),
+                t!("app.role_other").to_string(),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                right = right.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(rems(0.5))
+                        .child(label(name))
+                        .child(slot(base + 12 + offset * 2))
+                        .child(slot(base + 13 + offset * 2)),
+                );
+            }
+            for (label_text, offset) in [
+                (t!("app.card_background").to_string(), 20usize),
+                (t!("app.card_border").to_string(), 21),
+                (t!("app.card_hover").to_string(), 22),
+                (t!("app.card_selected_background").to_string(), 23),
+                (t!("app.card_selected_border").to_string(), 24),
+                (t!("app.card_foreground").to_string(), 25),
+                (t!("app.card_muted_foreground").to_string(), 26),
+                (t!("app.shell_surface").to_string(), 27),
+            ] {
+                right = right.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(rems(0.5))
+                        .child(label(label_text))
+                        .child(slot(base + offset)),
+                );
+            }
+
+            dialog
+                .title(t!("app.theme_colors").to_string())
+                .w(dialog_width(_window, 46.0))
+                .child(div().flex().flex_row().child(left).child(right))
+                .child( 
+                    div()
+                        .flex()
+                        .flex_row()
+                        .flex_wrap()
+                        .gap(rems(0.5))
+                        .child(
+                            Button::new("theme-new")
+                                .small()
+                                .label(t!("app.theme_new").to_string())
+                                .on_click(move |_, window, cx| {
+                                    let base = new_this.read(cx).colors().clone();
+                                    new_this.update(cx, |view, cx| view.new_theme(base, cx));
+                                    sync_theme_editor(
+                                        &s_new.0, &s_new.1, &s_new.2, &s_new.3, &s_new.4, window, cx,
+                                    );
+                                }),
+                        )
+                        .child(
+                            Button::new("theme-import")
+                                .small()
+                                .label(t!("app.theme_import").to_string())
+                                .on_click(move |_, window, cx| {
+                                    import_this.update(cx, |view, cx| {
+                                        view.import_theme(window, cx)
+                                    });
+                                    sync_theme_editor(
+                                        &s_import.0, &s_import.1, &s_import.2, &s_import.3, &s_import.4, window, cx,
+                                    );
+                                }),
+                        )
+                        .child(
+                            Button::new("theme-export")
+                                .small()
+                                .label(t!("app.theme_export").to_string())
+                                .on_click(move |_, window, cx| {
+                                    let id = id_for_export.clone();
+                                    export_this.update(cx, |view, cx| view.export_theme(&id, window, cx));
+                                }),
+                        )
+                        .child(div().w(rems(0.75)))
+                        .child(
+                            Button::new("theme-reset")
+                                .small()
+                                .label(t!("app.reset_defaults").to_string())
+                                .on_click(move |_, window, cx| {
+                                    if read_only {
+                                        return;
+                                    }
+                                    reset_this.update(cx, |view, cx| {
+                                        view.apply_color_theme(
+                                            crate::core::colors::BUILTIN_DEFAULT_ID, cx,
+                                        )
+                                    });
+                                    sync_theme_editor(
+                                        &s_reset.0, &s_reset.1, &s_reset.2, &s_reset.3, &s_reset.4, window, cx,
+                                    );
+                                }),
+                        )
+                        .child(
+                            Button::new("theme-delete")
+                                .small()
+                                .label(t!("app.theme_delete").to_string())
+                                .on_click(move |_, window, cx| {
+                                    if read_only {
+                                        return;
+                                    }
+                                    let id = id_for_delete.clone();
+                                    delete_this.update(cx, |view, cx| view.delete_theme(id, cx));
+                                    sync_theme_editor(
+                                        &s_delete.0, &s_delete.1, &s_delete.2, &s_delete.3, &s_delete.4, window, cx,
+                                    );
+                                }),
+                        )
+                        .child(
+                            Button::new("theme-apply")
+                                .small()
+                                .label(t!("app.theme_apply").to_string())
+                                .on_click(move |_, window, cx| {
+                                    let id = id_for_apply.clone();
+                                    apply_this.update(cx, |view, cx| view.apply_color_theme(&id, cx));
+                                    window.close_dialog(cx);
+                                }),
+                        )
+                        .child(
+                            Button::new("theme-cancel")
+                                .small()
+                                .label(t!("app.cancel").to_string())
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("theme-save")
+                                .small()
+                                .primary()
+                                .label(t!("app.save").to_string())
+                                .on_click(move |_, _window, cx| {
+                                    if read_only {
+                                        return;
+                                    }
+                                    let previous = save_this
+                                        .read(cx)
+                                        .book
+                                        .find(&id_for_save)
+                                        .map(|theme| theme.colors.clone())
+                                        .unwrap_or_default();
+                                    let mut colors = colors_from_pickers(&save_pickers, &previous, cx);
+                                    if let Some(color) = save_hue.read(cx).value() {
+                                        colors.derive_base =
+                                            Some(crate::core::colors::to_hex(color));
+                                    }
+                                    let name = save_name
+                                        .read(cx)
+                                        .value()
+                                        .to_string()
+                                        .trim()
+                                        .to_string();
+                                    let id = id_for_save.clone();
+                                    save_this.update(cx, |view, cx| {
+                                        view.save_theme_colors(id, colors, name, cx)
+                                    });
+                                }),
+                        ),
+                )
+                
+        });
+    }
+
+    /// 切到某套主题：写 settings 并立刻生效。
+    fn apply_color_theme(&mut self, id: &str, cx: &mut Context<Self>) {
+        if !self.book.set_current(id) {
+            return;
+        }
+        self.settings.general.theme_id = id.to_string();
+        let _ = self.settings.save();
+        crate::platform::taskbar::clear_icon_cache();
+        crate::platform::taskbar::apply_session_icons(
+            cx.theme().is_dark(),
+            &self.settings.roles,
+        );
+        cx.notify();
+    }
+
+    /// 保存当前主题的颜色与名称。
+    ///
+    /// **不切换**正在使用的主题——要切换是「应用主题」的事。只有保存的正好是
+    /// 当前正在用的那套时，才需要刷新界面让新颜色立刻生效。
+    fn save_theme_colors(
+        &mut self,
+        id: String,
+        colors: crate::core::colors::Colors,
+        name: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mut theme) = self.book.find(&id).cloned() else {
+            return;
+        };
+        theme.colors = colors;
+        if !name.is_empty() {
+            theme.name = name;
+        }
+        if let Err(error) = self.book.save_theme(theme) {
+            log::warn!("主题保存失败：{error}");
+            self.set_status(t!("app.save_failed", error = error.to_string()).to_string(), cx);
+            return;
+        }
+        if self.book.current_id() == id {
+            crate::platform::taskbar::clear_icon_cache();
+            crate::platform::taskbar::apply_session_icons(
+                cx.theme().is_dark(),
+                &self.settings.roles,
+            );
+        }
+        cx.notify();
+    }
+
+    /// 新建一套主题：配色复制当前主题，名字取「主题 N」。
+    fn new_theme(&mut self, colors: crate::core::colors::Colors, cx: &mut Context<Self>) {
+        let theme = crate::core::colors::NamedTheme {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: self.book.next_name(),
+            builtin: false,
+            colors,
+        };
+        let id = theme.id.clone();
+        if let Err(error) = self.book.save_theme(theme) {
+            log::warn!("新建主题失败：{error}");
+            return;
+        }
+        self.apply_color_theme(&id, cx);
+    }
+    /// 导出：把该主题序列化成 JSON 文本复制到剪贴板。
+    fn export_theme(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(theme) = self.book.find(id).cloned() else {
+            return;
+        };
+        let Ok(text) = serde_json::to_string_pretty(&theme) else {
+            return;
+        };
+        cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(text));
+        self.toast(
+            t!("app.theme_exported").to_string(),
+            NotificationType::Success,
+            window,
+            cx,
+        );
+    }
+
+    /// 导入：从剪贴板读 JSON，解析成一套主题加入主题库。
+    ///
+    /// 兼容三种形态：单套主题、旧整库（含 `themes` 数组）、只有 name+colors 的手写对象。
+    /// 解析不了或配色不完整就直接拒绝，不做半吊子导入。
+    fn import_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(item) = cx.read_from_clipboard() else {
+            self.toast(
+                t!("app.theme_import_empty").to_string(),
+                NotificationType::Warning,
+                window,
+                cx,
+            );
+            return;
+        };
+        let text = item.text().unwrap_or_default();
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+            self.toast(
+                t!("app.theme_import_failed").to_string(),
+                NotificationType::Error,
+                window,
+                cx,
+            );
+            return;
+        };
+
+        let raw = if value.get("themes").is_some() {
+            value["themes"].get(0).cloned().unwrap_or_default()
+        } else {
+            value
+        };
+        let Ok(mut theme) = serde_json::from_value::<crate::core::colors::NamedTheme>(raw) else {
+            self.toast(
+                t!("app.theme_import_failed").to_string(),
+                NotificationType::Error,
+                window,
+                cx,
+            );
+            return;
+        };
+        // 配色必须完整才收：客户端 6 组是硬要求，缺了说明不是本程序的主题。
+        if theme.colors.light.cycle.len() != 6 || theme.colors.dark.cycle.len() != 6 {
+            self.toast(
+                t!("app.theme_import_failed").to_string(),
+                NotificationType::Error,
+                window,
+                cx,
+            );
+            return;
+        }
+
+        if theme.id.is_empty() || theme.id == crate::core::colors::BUILTIN_DEFAULT_ID {
+            theme.id = uuid::Uuid::new_v4().to_string();
+        }
+        theme.builtin = false;
+        if theme.name.trim().is_empty() {
+            theme.name = self.book.next_name();
+        }
+        let id = theme.id.clone();
+        if let Err(error) = self.book.save_theme(theme) {
+            log::warn!("导入主题失败：{error}");
+            self.toast(
+                t!("app.theme_import_failed").to_string(),
+                NotificationType::Error,
+                window,
+                cx,
+            );
+            return;
+        }
+        self.apply_color_theme(&id, cx);
+        self.toast(
+            t!("app.theme_imported").to_string(),
+            NotificationType::Success,
+            window,
+            cx,
+        );
+    }
+    /// 删除一套主题（内置主题与「默认」不可删）。
+    fn delete_theme(&mut self, id: String, cx: &mut Context<Self>) {
+        if !self.book.remove_theme(&id) {
+            return;
+        }
+        let current = self.book.current_id().to_string();
+        self.apply_color_theme(&current, cx);
+    }
+
+    /// 某台系统的角色：手动指定优先，否则按系统标识推断。
+    ///
+    /// 键是**系统标识（SID）**：同一台系统的所有快捷方式、以及任务栏图标共用同一个角色。
+    fn role_of(&self, systemid: &str) -> crate::core::role::SystemRole {
+        self.settings
+            .roles
+            .get(systemid)
+            .and_then(|key| crate::core::role::SystemRole::from_key(key))
+            .unwrap_or_else(|| crate::core::role::SystemRole::detect(systemid))
+    }
+
+    /// 手动指定角色的入口：小对话框，四选一加「跟随识别」。
+    fn begin_set_role(&mut self, systemid: String, window: &mut Window, cx: &mut Context<Self>) {
+        let this = cx.entity().clone();
+        let service = systemid.clone();
+        window.open_dialog(cx, move |dialog, _window, cx| {
+            let current = this.read(cx).settings.roles.get(&service).cloned();
+            let mut body = div().flex().flex_col().gap(rems(0.25));
+            for (role, key) in crate::core::role::SystemRole::choices() {
+                let label = match role {
+                    crate::core::role::SystemRole::Dev => t!("app.role_dev").to_string(),
+                    crate::core::role::SystemRole::Qas => t!("app.role_qas").to_string(),
+                    crate::core::role::SystemRole::Prd => t!("app.role_prd").to_string(),
+                    crate::core::role::SystemRole::Other => t!("app.role_other").to_string(),
+                };
+                let owner = this.clone();
+                let target = service.clone();
+                let active = current.as_deref() == Some(key);
+                let button = Button::new(format!("role-{}", role.key())).small().label(label);
+                let button = if active { button.primary() } else { button };
+                body = body.child(button.on_click(move |_, window, cx| {
+                    let target = target.clone();
+                    owner.update(cx, |view, cx| view.set_role(target, key.to_string(), cx));
+                    window.close_dialog(cx);
+                }));
+            }
+            let owner = this.clone();
+            let target = service.clone();
+            let auto = current.is_none();
+            let button = Button::new("role-auto")
+                .small()
+                .label(t!("app.role_auto").to_string());
+            let button = if auto { button.primary() } else { button };
+            body = body.child(button.on_click(move |_, window, cx| {
+                let target = target.clone();
+                owner.update(cx, |view, cx| view.set_role(target, String::new(), cx));
+                window.close_dialog(cx);
+            }));
+            dialog
+                .title(t!("app.set_role").to_string())
+                .w(dialog_width(_window, 18.0))
+                .child(body)
+        });
+    }
+
+    /// 写入/清除手动角色。空字符串表示「跟随识别」。
+    fn set_role(&mut self, systemid: String, role: String, cx: &mut Context<Self>) {
+        if role.is_empty() {
+            self.settings.roles.remove(&systemid);
+        } else {
+            self.settings.roles.insert(systemid, role);
+        }
+        let _ = self.settings.save();
+        cx.notify();
+    }
+
+    /// 当前正在使用的配色。
+    fn colors(&self) -> &crate::core::colors::Colors {
+        self.book.active()
+    }
     /// 设置：标准 Dialog。
     fn open_settings_dialog(&self, window: &mut Window, cx: &mut Context<Self>) {
         let this = cx.entity().clone();
@@ -1603,6 +2397,7 @@ impl RootView {
                     div()
                         .flex()
                         .flex_row()
+                        .flex_wrap()
                         .gap(rems(0.5))
                         .child(
                             Button::new("settings-cancel")
@@ -1762,6 +2557,7 @@ impl RootView {
                     div()
                         .flex()
                         .flex_row()
+                        .flex_wrap()
                         .gap(rems(0.5))
                         .child(
                             Button::new("delete-cancel")
@@ -1896,6 +2692,7 @@ impl RootView {
                     div()
                         .flex()
                         .flex_row()
+                        .flex_wrap()
                         .gap(rems(0.5))
                         .child(
                             Button::new("alias-cancel")
@@ -1956,19 +2753,44 @@ impl RootView {
         });
     }
 
-    /// 双击卡片 / 右键「登录」：有密码直接登录，没有就弹框输入。
+    /// 回车键入口。
+    ///
+    /// 两个凭据输入框只出现在密码弹框里，所以有 `password_target` 就当场确认提交；
+    /// 否则退回「登录当前选中项」。之前这里直接调 `login`，而 `login` 发现凭据还没存
+    /// 就会把弹框重开、清空刚输入的密码——表现就是按回车没反应。
+    fn submit_credentials(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.password_target.is_some() {
+            self.confirm_password(window, cx);
+            // 只有真的提交成功才关框：账号或密码为空要留在原地让用户补。
+            if self.password_target.is_none() {
+                window.close_dialog(cx);
+            }
+        } else {
+            self.login(window, cx);
+        }
+    }
+
+    /// 登录当前选中的那一条。卡片与右键菜单不走这里——它们直接给 uuid。
     fn login(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(service_id) = self.selected.clone() else {
-            self.status = t!("app.select_first").to_string();
+            self.set_status(t!("app.select_first").to_string(), cx);
             return;
         };
+        self.login_service(service_id, window, cx);
+    }
+
+    /// 按 uuid 登录：有密码直接登录，没有就弹框输入。
+    ///
+    /// 卡片双击和右键菜单本来就知道自己是哪一条，不该再去读「当前选中项」：
+    /// 选中项有 3 秒自动清除，靠它兜底会让这类操作偶发失效，而且失败是静默的。
+    fn login_service(&mut self, service_id: String, window: &mut Window, cx: &mut Context<Self>) {
         let (service_uuid, service_name, service_user) = {
             let Some(landscape) = &self.landscape else {
-                self.status = t!("app.landscape_not_found").to_string();
+                self.set_status(t!("app.landscape_not_found").to_string(), cx);
                 return;
             };
             let Some(service) = landscape.service(&service_id) else {
-                self.status = t!("app.shortcut_gone").to_string();
+                self.set_status(t!("app.shortcut_gone").to_string(), cx);
                 return;
             };
             (
@@ -2060,20 +2882,20 @@ impl RootView {
         cx: &mut Context<Self>,
     ) {
         let Some(landscape) = &self.landscape else {
-            self.status = t!("app.landscape_not_found").to_string();
+            self.set_status(t!("app.landscape_not_found").to_string(), cx);
             return;
         };
         let Some(service) = landscape.service(&service_uuid) else {
-            self.status = "快捷方式已不存在".into();
+            self.set_status("快捷方式已不存在".into(), cx);
             return;
         };
         let Some(base) = landscape.base_of(service) else {
-            self.status = t!("app.base_gone").to_string();
+            self.set_status(t!("app.base_gone").to_string(), cx);
             return;
         };
         let client = service.client.trim().to_string();
         if client.is_empty() {
-            self.status = t!("app.no_client").to_string();
+            self.set_status(t!("app.no_client").to_string(), cx);
             return;
         }
         let language = if service.language.trim().is_empty() {
@@ -2092,7 +2914,7 @@ impl RootView {
         let service_name = service.name.clone();
 
         let Some(exe) = shcut::find_sapshcut(&self.settings.sap.sapshcut_path) else {
-            self.status = t!("app.sapshcut_missing").to_string();
+            self.set_status(t!("app.sapshcut_missing").to_string(), cx);
             return;
         };
         log::info!("launch: {}", shcut::masked_command(&exe, &args));
@@ -2103,11 +2925,13 @@ impl RootView {
                 self.status = t!("app.launched", name = service_name).to_string();
                 self.toast(self.status.clone(), NotificationType::Success, window, cx);
                 // SAP GUI 拉窗口要几秒，等它出现再补任务栏图标；只补这一次，不轮询。
+                let dark = cx.theme().is_dark();
+                let roles = self.settings.roles.clone();
                 cx.spawn(async move |_this, cx| {
                     cx.background_executor()
                         .timer(std::time::Duration::from_millis(4000))
                         .await;
-                    crate::platform::taskbar::apply_session_icons();
+                    crate::platform::taskbar::apply_session_icons(dark, &roles);
                 })
                 .detach();
             }
@@ -2165,6 +2989,13 @@ impl RootView {
                 tool("new-shortcut", "+").on_click(cx.listener(
                     |this, _: &ClickEvent, window, cx| {
                         this.begin_new_shortcut(window, cx);
+                    },
+                )),
+            )
+            .child(
+                tool("open-theme", "🎨").on_click(cx.listener(
+                    |this, _: &ClickEvent, window, cx| {
+                        this.open_theme_dialog(window, cx);
                     },
                 )),
             )
@@ -2621,6 +3452,7 @@ impl RootView {
                     div()
                         .flex()
                         .flex_row()
+                        .flex_wrap()
                         .gap(rems(0.5))
                         .child(
                             Button::new("new-cancel")
@@ -2775,7 +3607,13 @@ impl RootView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let selected = self.selected.as_deref() == Some(service.uuid.as_str());
-        let muted = cx.theme().muted_foreground;
+        // 卡片里的次要文字也跟着主题走，不再吃 gpui-kit 的语义色。
+        let muted: Hsla = self
+            .colors()
+            .palette(cx.theme().is_dark())
+            .card_palette()
+            .muted_foreground
+            .into();
 
         let base = landscape.base_of(service);
         let sid = base.map(|base| base.systemid.clone()).unwrap_or_default();
@@ -2804,19 +3642,18 @@ impl RootView {
         };
 
         let dark = cx.theme().is_dark();
-        let sid_index = match sid.chars().next() {
-            Some('D') | Some('d') => 0,
-            Some('Q') | Some('q') => 2,
-            Some('P') | Some('p') => 3,
-            _ => 5,
-        };
+        let palette = self.colors().palette(dark);
+        // 系统标识用「角色色」，客户端用「循环色」——两套各自可编辑。
+        let sid_tag = palette
+            .role
+            .of_role(self.role_of(&sid))
+            .clone();
         let client_index = self.client_colors.get(client.trim()).copied().unwrap_or(0);
         let pinned = self.settings.window.pinned.contains(&service.uuid);
 
         let uuid = service.uuid.clone();
         let uuid_hover = uuid.clone();
         let uuid_click = uuid.clone();
-        let uuid_double = uuid.clone();
         let name = self
             .settings
             .aliases
@@ -2845,11 +3682,7 @@ impl RootView {
             .flex()
             .flex_col()
             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                this.select(uuid_click.clone(), window, cx)
-            }))
-            .on_double_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                this.select(uuid_double.clone(), window, cx);
-                this.login(window, cx);
+                this.click_card(uuid_click.clone(), window, cx)
             }))
             .on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {
                 let target = if *hovered { Some(uuid_hover.clone()) } else { None };
@@ -2862,6 +3695,7 @@ impl RootView {
                 Card::new(element_id("card-surface", &uuid))
                     .selected(selected)
                     .hovered(self.hovered_card.as_deref() == Some(uuid.as_str()))
+                    .palette(palette.card_palette())
                     .flex_1()
                     .child(
                         div()
@@ -2914,8 +3748,8 @@ impl RootView {
                                     .text_color(muted)
                                     .child(user),
                             )
-                            .child(soft_tag(sid.clone(), sid_index, dark))
-                            .child(soft_tag(client.clone(), client_index, dark)),
+                            .child(soft_tag(sid.clone(), &sid_tag))
+                            .child(soft_tag_cycle(client.clone(), client_index, palette)),
                     ),
             );
 
@@ -2936,6 +3770,8 @@ impl RootView {
                 let uuid_password = uuid_menu.clone();
                 let uuid_edit = uuid_menu.clone();
                 let uuid_alias = uuid_menu.clone();
+                let uuid_role = sid.clone();
+                                let role_this = this.clone();
                 let uuid_pin = uuid_menu.clone();
                 let uuid_up = uuid_menu.clone();
                 let uuid_down = uuid_menu.clone();
@@ -2945,9 +3781,10 @@ impl RootView {
                 menu.item(
                     PopupMenuItem::new(t!("app.login").to_string()).on_click(move |_, window, cx| {
                         let uuid = uuid_login.clone();
+                        let service = uuid.clone();
                         login_this.update(cx, |view, cx| {
                             view.select(uuid, window, cx);
-                            view.login(window, cx);
+                            view.login_service(service, window, cx);
                         });
                     }),
                 )
@@ -2964,6 +3801,14 @@ impl RootView {
                         let uuid = uuid_edit.clone();
                         edit_this.update(cx, |view, cx| {
                             view.begin_edit(uuid, window, cx);
+                        });
+                    }),
+                )
+                .item(
+                    PopupMenuItem::new(t!("app.set_role").to_string()).on_click(move |_, window, cx| {
+                        let key = uuid_role.clone();
+                        role_this.update(cx, |view, cx| {
+                            view.begin_set_role(key, window, cx);
                         });
                     }),
                 )
@@ -3017,6 +3862,8 @@ impl RootView {
                 let delete_this = this.clone();
                 let uuid_password = uuid_menu.clone();
                 let uuid_alias = uuid_menu.clone();
+                let uuid_role = sid.clone();
+                                let role_this = this.clone();
                 let uuid_edit = uuid_menu.clone();
                 let uuid_pin = uuid_menu.clone();
                 let uuid_delete = uuid_menu.clone();
@@ -3025,9 +3872,10 @@ impl RootView {
                 menu.item(
                     PopupMenuItem::new(t!("app.login").to_string()).on_click(move |_, window, cx| {
                         let uuid = uuid_login.clone();
+                        let service = uuid.clone();
                         login_this.update(cx, |view, cx| {
                             view.select(uuid, window, cx);
-                            view.login(window, cx);
+                            view.login_service(service, window, cx);
                         });
                     }),
                 )
@@ -3044,6 +3892,14 @@ impl RootView {
                         let uuid = uuid_edit.clone();
                         edit_this.update(cx, |view, cx| {
                             view.begin_edit(uuid, window, cx);
+                        });
+                    }),
+                )
+                .item(
+                    PopupMenuItem::new(t!("app.set_role").to_string()).on_click(move |_, window, cx| {
+                        let key = uuid_role.clone();
+                        role_this.update(cx, |view, cx| {
+                            view.begin_set_role(key, window, cx);
                         });
                     }),
                 )
@@ -3109,6 +3965,7 @@ impl RootView {
                     div()
                         .flex()
                         .flex_row()
+                        .flex_wrap()
                         .gap(rems(0.5))
                         .child(
                             Button::new("password-cancel")
@@ -3252,31 +4109,133 @@ fn card_groups(landscape: &Landscape) -> Vec<CardGroup> {
     out
 }
 
-/// 卡片徽标的柔和配色：浅色主题淡底深字，深色主题深底亮字。
-/// 刻意不用主题的语义色——那些是给状态/警告用的，用在几十张卡片上太扎眼。
-fn soft_tag_colors(index: usize, dark: bool) -> (gpui_kit::Rgba, gpui_kit::Rgba) {
-    const LIGHT: [(u32, u32); 6] = [
-        (0xE3EDFB, 0x1F4E8C),
-        (0xE2F2E7, 0x1E6B3A),
-        (0xFBF0DC, 0x7A5410),
-        (0xF6E4E7, 0x8E2F3C),
-        (0xEDE7F8, 0x553388),
-        (0xE1F1F1, 0x155F5F),
-    ];
-    const DARK: [(u32, u32); 6] = [
-        (0x1B2A3D, 0xA8C7F0),
-        (0x1B2E23, 0xA8DDB8),
-        (0x322A1A, 0xE0C080),
-        (0x352124, 0xE8A0A8),
-        (0x2A2238, 0xC0A8E8),
-        (0x1A2E2E, 0x90D0D0),
-    ];
-    let (background, foreground) = if dark { DARK[index % 6] } else { LIGHT[index % 6] };
-    (rgb(background), rgb(foreground))
+/// 把一套配色摊平成一维槽位表，供对话框批量创建/回填选择器：
+/// 每模式 6 组循环色 ×(底/字) + 4 角色 ×(底/字) + 卡片 7 色 + 窗口底色 = 28 个，
+/// 浅色 28 个在前，深色 28 个在后。
+fn color_slots(colors: &crate::core::colors::Colors) -> Vec<String> {
+    let mut out = Vec::with_capacity(56);
+    for palette in [&colors.light, &colors.dark] {
+        for index in 0..6 {
+            let tag = palette.cycle_at(index);
+            out.push(tag.bg.clone());
+            out.push(tag.fg.clone());
+        }
+        for tag in palette.role.all() {
+            out.push(tag.bg.clone());
+            out.push(tag.fg.clone());
+        }
+        let card = &palette.card;
+        out.push(card.background.clone());
+        out.push(card.border.clone());
+        out.push(card.hover.clone());
+        out.push(card.selected_background.clone());
+        out.push(card.selected_border.clone());
+        out.push(card.foreground.clone());
+        out.push(card.muted_foreground.clone());
+        out.push(palette.shell.clone());
+    }
+    out
 }
 
-fn soft_tag(label: String, index: usize, dark: bool) -> impl IntoElement {
-    let (background, foreground) = soft_tag_colors(index, dark);
+/// 让对话框里的选择器与名称框跟上「正在编辑的主题」。
+/// 新建 / 导入 / 删除 / 应用之后都调它，免得留在框里的还是上一套的值。
+fn sync_theme_editor(
+    this: &gpui_kit::Entity<RootView>,
+    pickers: &[gpui_kit::Entity<gpui_kit::component::color_picker::ColorPickerState>],
+    editing: &gpui_kit::Entity<String>,
+    name_state: &gpui_kit::Entity<InputState>,
+    hue_state: &gpui_kit::Entity<gpui_kit::component::color_picker::ColorPickerState>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let id = this.read(cx).book.current_id().to_string();
+    let Some(theme) = this.read(cx).book.find(&id).cloned() else {
+        return;
+    };
+    let colors = theme.colors;
+    let name = theme.name;
+    for (index, hex) in color_slots(&colors).iter().enumerate() {
+        if let Some(picker) = pickers.get(index) {
+            let color: gpui_kit::Hsla = crate::core::colors::rgba(hex).into();
+            picker.update(cx, |state, cx| state.set_value(color, window, cx));
+        }
+    }
+    name_state.update(cx, |state, cx| state.set_value(name, window, cx));
+    let base_hex = colors
+        .derive_base
+        .clone()
+        .unwrap_or_else(|| colors.light.card.selected_background.clone());
+    let base_color: gpui_kit::Hsla = crate::core::colors::rgba(&base_hex).into();
+    hue_state.update(cx, |state, cx| state.set_value(base_color, window, cx));
+    editing.update(cx, |slot, cx| {
+        *slot = id;
+        cx.notify();
+    });
+    this.update(cx, |_, cx| cx.notify());
+}
+
+/// 从选择器里读回整套配色；某个槽没选过就保留原值。
+///
+/// 每种模式 22 个槽：6 组循环色 ×(底/字) + 4 个角色色 ×(底/字) + 卡片底 + 窗口底。
+fn colors_from_pickers(
+    pickers: &[Entity<gpui_kit::component::color_picker::ColorPickerState>],
+    previous: &crate::core::colors::Colors,
+    cx: &App,
+) -> crate::core::colors::Colors {
+    const PER_MODE: usize = 28;
+    let palette = |base: usize, old: &crate::core::colors::Palette| {
+        let hex = |index: usize, fallback: &str| {
+            pickers
+                .get(base + index)
+                .and_then(|state| state.read(cx).value())
+                .map(crate::core::colors::to_hex)
+                .unwrap_or_else(|| fallback.to_string())
+        };
+        let mut cycle = Vec::with_capacity(6);
+        for index in 0..6 {
+            let tag = old.cycle_at(index);
+            cycle.push(crate::core::colors::TagColor {
+                bg: hex(index * 2, &tag.bg),
+                fg: hex(index * 2 + 1, &tag.fg),
+            });
+        }
+        let role = |offset: usize, tag: &crate::core::colors::TagColor| {
+            crate::core::colors::TagColor {
+                bg: hex(12 + offset * 2, &tag.bg),
+                fg: hex(13 + offset * 2, &tag.fg),
+            }
+        };
+        let card = &old.card;
+        crate::core::colors::Palette {
+            cycle,
+            role: crate::core::colors::RoleColors {
+                dev: role(0, &old.role.dev),
+                qas: role(1, &old.role.qas),
+                prd: role(2, &old.role.prd),
+                other: role(3, &old.role.other),
+            },
+            card: crate::core::colors::CardColors {
+                background: hex(20, &card.background),
+                border: hex(21, &card.border),
+                hover: hex(22, &card.hover),
+                selected_background: hex(23, &card.selected_background),
+                selected_border: hex(24, &card.selected_border),
+                foreground: hex(25, &card.foreground),
+                muted_foreground: hex(26, &card.muted_foreground),
+            },
+            shell: hex(27, &old.shell),
+        }
+    };
+    crate::core::colors::Colors {
+        light: palette(0, &previous.light),
+        dark: palette(PER_MODE, &previous.dark),
+        derive_base: previous.derive_base.clone(),
+    }
+}
+
+fn soft_tag(label: String, tag: &crate::core::colors::TagColor) -> impl IntoElement {
+    let background = crate::core::colors::rgba(&tag.bg);
+    let foreground = crate::core::colors::rgba(&tag.fg);
     div()
         .h(rems(0.9375))
         .px(rems(0.3125))
@@ -3287,6 +4246,15 @@ fn soft_tag(label: String, index: usize, dark: bool) -> impl IntoElement {
         .flex()
         .items_center()
         .child(label)
+}
+
+/// 客户端的徽标：按字典序循环取用 6 组循环色之一。
+fn soft_tag_cycle(
+    label: String,
+    index: usize,
+    palette: &crate::core::colors::Palette,
+) -> impl IntoElement {
+    soft_tag(label, palette.cycle_at(index))
 }
 
 fn section_title(name: &str, muted: Hsla) -> impl IntoElement {
@@ -3405,7 +4373,7 @@ impl Render for RootView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // 深色下不透明档的底色；有材质时整窗不铺底色，让云母原样透出来。
         let shell: gpui_kit::Hsla = if cx.theme().is_dark() {
-            gpui_kit::rgb(0x161618).into()
+            crate::core::colors::rgba(&self.colors().dark.shell).into()
         } else {
             cx.theme().sidebar
         };

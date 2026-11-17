@@ -9,7 +9,8 @@ pub mod system;
 pub mod taskbar;
 #[cfg(not(target_os = "windows"))]
 pub mod taskbar {
-    pub fn apply_session_icons() {}
+    pub fn apply_session_icons(_dark: bool, _roles: &std::collections::HashMap<String, String>) {}
+    pub fn clear_icon_cache() {}
 }
 pub mod tray;
 pub mod window;

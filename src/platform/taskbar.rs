@@ -33,15 +33,21 @@ fn taskbar_icon_size(hwnd: HWND) -> u32 {
     ((24 * dpi + 48) / 96).max(16)
 }
 
-/// SID → 颜色，与卡片上 SID 标签用的是同一套：
-/// 开发蓝、质量金、生产红、其余青。图标背景取这组饱和色，白字才压得住。
-fn sid_color(sid: &str) -> (u8, u8, u8) {
-    match sid.chars().next().map(|c| c.to_ascii_uppercase()) {
-        Some('D') => (0x1F, 0x4E, 0x8C),
-        Some('Q') => (0x7A, 0x54, 0x10),
-        Some('P') => (0x8E, 0x2F, 0x3C),
-        _ => (0x15, 0x5F, 0x5F),
-    }
+/// SID → 颜色，与卡片上 SID 标签用的是同一套（角色色）。
+/// 具体色值来自用户可编辑的配色配置，见 [`crate::core::colors`]。
+fn sid_color(
+    sid: &str,
+    palette: &crate::core::colors::Palette,
+    roles: &HashMap<String, String>,
+) -> (u8, u8, u8) {
+    // 手动指定的角色优先（键就是系统标识），没设过才按标识推断。
+    let role = roles
+        .get(sid)
+        .and_then(|key| crate::core::role::SystemRole::from_key(key))
+        .unwrap_or_else(|| crate::core::role::SystemRole::detect(sid));
+    let rgba = crate::core::colors::rgba(&palette.role.of_role(role).fg);
+    let channel = |value: f32| (value.clamp(0., 1.) * 255.).round() as u8;
+    (channel(rgba.r), channel(rgba.g), channel(rgba.b))
 }
 
 /// 已创建的图标句柄，按 `(系统标识, 客户端, 像素尺寸)` 缓存：重复创建会泄漏
@@ -50,7 +56,7 @@ fn sid_color(sid: &str) -> (u8, u8, u8) {
 static ICONS: Mutex<Option<HashMap<(String, String, u32), isize>>> = Mutex::new(None);
 
 /// 扫一遍现有会话窗口，把缺图标的补上。启动时和每次登录后调用即可。
-pub fn apply_session_icons() {
+pub fn apply_session_icons(dark: bool, roles: &std::collections::HashMap<String, String>) {
     // 只有 SAP GUI 8.10 且任务栏按「系统标识和客户端」分组时才值得动手：
     // 窗口本来不分组的话，每张图标都一样，画了也没意义。
     if !crate::platform::system::taskbar_grouped_by_system() {
@@ -71,13 +77,15 @@ pub fn apply_session_icons() {
         Err(_) => return,
     };
     let icons = guard.get_or_insert_with(HashMap::new);
+    // 图标底色跟着当前明暗的那套配色走；换主题后缓存要清，否则还是旧色。
+    let palette = crate::core::colors::Colors::load().palette(dark).clone();
 
     let total = sessions.len();
     for (hwnd, sid, client) in sessions {
         let size = taskbar_icon_size(hwnd);
-        let small = icon_for(icons, &sid, &client, size);
+        let small = icon_for(icons, &sid, &client, size, &palette, roles);
         // 大图标给 Alt+Tab、任务视图用，约等于 32px @100% 的等比版本。
-        let big = icon_for(icons, &sid, &client, (size * 4).div_ceil(3));
+        let big = icon_for(icons, &sid, &client, (size * 4).div_ceil(3), &palette, roles);
         unsafe {
             SendMessageW(hwnd, WM_SETICON, ICON_BIG, big as LPARAM);
             SendMessageW(hwnd, WM_SETICON, ICON_SMALL, small as LPARAM);
@@ -92,14 +100,25 @@ fn icon_for(
     sid: &str,
     client: &str,
     size: u32,
+    palette: &crate::core::colors::Palette,
+    roles: &HashMap<String, String>,
 ) -> isize {
     let key = (sid.to_string(), client.to_string(), size);
     match icons.get(&key) {
         Some(icon) => *icon,
         None => {
-            let icon = build_icon(sid, client, size);
+            let icon = build_icon(sid, client, size, palette, roles);
             icons.insert(key, icon);
             icon
+        }
+    }
+}
+
+/// 换配色后必须清缓存：缓存键只有 (SID, 客户端, 尺寸)，颜色不在里面。
+pub fn clear_icon_cache() {
+    if let Ok(mut guard) = ICONS.lock() {
+        if let Some(icons) = guard.as_mut() {
+            icons.clear();
         }
     }
 }
@@ -144,8 +163,14 @@ fn split_title(title: &str) -> Option<(String, String)> {
     Some((sid.to_string(), client))
 }
 
-fn build_icon(sid: &str, client: &str, size: u32) -> isize {
-    let (r, g, b) = sid_color(sid);
+fn build_icon(
+    sid: &str,
+    client: &str,
+    size: u32,
+    palette: &crate::core::colors::Palette,
+    roles: &HashMap<String, String>,
+) -> isize {
+    let (r, g, b) = sid_color(sid, palette, roles);
     // 圆角底色走像素绘制（抗锯齿），数字用点阵——小尺寸下的矢量字体笔画会糊。
     let mut pixels = render_background(size, (r, g, b));
     draw_digits(&mut pixels, size, client);

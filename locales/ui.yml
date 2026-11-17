@@ -312,6 +312,114 @@ app:
   update_progress:
     en: "%{done} of %{total}"
     zh-CN: "已下载 %{done} / %{total}"
+  theme_colors:
+    en: "Colors"
+    zh-CN: "主题配色"
+  client_color:
+    en: "Client %{index}"
+    zh-CN: "客户端 %{index}"
+  role_dev:
+    en: "Development"
+    zh-CN: "开发"
+  role_qas:
+    en: "Test"
+    zh-CN: "测试"
+  role_prd:
+    en: "Production"
+    zh-CN: "生产"
+  role_other:
+    en: "Other"
+    zh-CN: "其他"
+  card_surface:
+    en: "Card background"
+    zh-CN: "卡片底色"
+  card_background:
+    en: "Card background"
+    zh-CN: "卡片底色"
+  card_border:
+    en: "Card border"
+    zh-CN: "卡片边框"
+  card_hover:
+    en: "Card hover"
+    zh-CN: "卡片悬停底色"
+  card_selected_background:
+    en: "Selected card"
+    zh-CN: "卡片选中底色"
+  card_selected_border:
+    en: "Selected border"
+    zh-CN: "卡片选中边框"
+  card_foreground:
+    en: "Card text"
+    zh-CN: "卡片文字"
+  card_muted_foreground:
+    en: "Card secondary text"
+    zh-CN: "卡片次要文字"
+  shell_surface:
+    en: "Window background"
+    zh-CN: "窗口底色"
+  reset_defaults:
+    en: "Reset to defaults"
+    zh-CN: "恢复默认"
+  color_scheme:
+    en: "Scheme"
+    zh-CN: "色系"
+  theme_name:
+    en: "Name"
+    zh-CN: "名称"
+  theme_builtin:
+    en: "built-in, read-only"
+    zh-CN: "内置，不可修改"
+  theme_editable:
+    en: "editable"
+    zh-CN: "可修改"
+  theme_derive:
+    en: "Derive"
+    zh-CN: "派生"
+  theme_derive_run:
+    en: "Derive"
+    zh-CN: "派生"
+  theme_import:
+    en: "Import"
+    zh-CN: "导入"
+  theme_export:
+    en: "Export"
+    zh-CN: "导出"
+  theme_exported:
+    en: "Theme copied to clipboard"
+    zh-CN: "主题已复制到剪贴板"
+  theme_imported:
+    en: "Theme imported"
+    zh-CN: "主题已导入"
+  theme_import_empty:
+    en: "Clipboard is empty"
+    zh-CN: "剪贴板是空的"
+  theme_import_failed:
+    en: "Clipboard is not a valid theme"
+    zh-CN: "剪贴板里不是有效的主题"
+  set_role:
+    en: "System role…"
+    zh-CN: "设置角色…"
+  role_auto:
+    en: "Follow detection"
+    zh-CN: "跟随识别"
+  theme_library:
+    en: "Themes"
+    zh-CN: "主题库"
+  theme_new:
+    en: "New theme"
+    zh-CN: "新建主题"
+  theme_apply:
+    en: "Apply theme"
+    zh-CN: "应用主题"
+  theme_delete:
+    en: "Delete theme"
+    zh-CN: "删除主题"
+  color_bg:
+    en: "Fill"
+    zh-CN: "底色"
+  color_fg:
+    en: "Text"
+    zh-CN: "文字色"
   current_version:
     en: "Current version: %{version}"
     zh-CN: "当前版本：%{version}"

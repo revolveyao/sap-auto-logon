@@ -28,6 +28,10 @@ pub struct AppSettings {
     /// 放顶层而不是 window 段：它不是窗口状态，清窗口位置时不该一起丢。
     #[serde(default)]
     pub aliases: HashMap<String, String>,
+    /// 系统角色手动指定：系统标识（SID）→ dev/qas/prd/other。
+    /// 键是 SID：同一台系统的所有快捷方式与任务栏图标共用同一个角色。
+    #[serde(default)]
+    pub roles: HashMap<String, String>,
 }
 
 impl Default for AppSettings {
@@ -39,6 +43,7 @@ impl Default for AppSettings {
             sap: Sap::default(),
             window: WindowState::default(),
             aliases: HashMap::new(),
+            roles: HashMap::new(),
         }
     }
 }
@@ -73,6 +78,8 @@ pub struct General {
     pub log_dir: String,
     /// 每次启动时检查一次新版本
     pub auto_check_update: bool,
+    /// 主题库里正在使用的那套（存 id，改名不影响）
+    pub theme_id: String,
 }
 
 impl Default for General {
@@ -93,6 +100,7 @@ impl Default for General {
             log_level: "error".into(),
             log_dir: String::new(),
             auto_check_update: true,
+            theme_id: String::new(),
         }
     }
 }

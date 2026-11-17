@@ -16,6 +16,8 @@ pub struct Card {
     id: ElementId,
     selected: bool,
     hovered: bool,
+    /// 卡片配色，来自用户可编辑的主题。取不到就退回 gpui-kit 主题的语义色。
+    palette: Option<crate::core::colors::CardPalette>,
     style: StyleRefinement,
     children: Vec<AnyElement>,
 }
@@ -26,9 +28,16 @@ impl Card {
             id: id.into(),
             selected: false,
             hovered: false,
+            palette: None,
             style: StyleRefinement::default(),
             children: Vec::new(),
         }
+    }
+
+    /// 卡片配色（底色、边框、悬停、选中、文字）。
+    pub fn palette(mut self, palette: crate::core::colors::CardPalette) -> Self {
+        self.palette = Some(palette);
+        self
     }
 
     pub fn selected(mut self, selected: bool) -> Self {
@@ -63,18 +72,14 @@ impl RenderOnce for Card {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
         let selected = self.selected;
-        let border = theme.border;
-        // 选中用信息蓝，不用 primary——深色主题里 primary 接近纯黑，边框像画框。
-        let accent = theme.info;
-        // 深色主题的默认背景偏纯黑，用比 Mica 略亮一档的深灰（#2A2A2C）：
-        // 窗口底是云母的深灰，卡片再暗就糊在一起了。
-        let background = if theme.is_dark() {
-            gpui_kit::rgb(0x2A2A2C).into()
-        } else {
-            theme.background
-        };
-        let selection = theme.selection;
-        let hover = theme.muted;
+        // 配色以用户主题为准；没给就沿用 gpui-kit 主题原来的语义色。
+        let palette = self.palette;
+        let border = palette.map_or(theme.border, |p| p.border.into());
+        let accent = palette.map_or(theme.info, |p| p.selected_border.into());
+        let background = palette.map_or(theme.background, |p| p.background.into());
+        let selection = palette.map_or(theme.selection, |p| p.selected_background.into());
+        let hover = palette.map_or(theme.muted, |p| p.hover.into());
+        let foreground = palette.map_or(theme.foreground, |p| p.foreground.into());
 
         // 目标驱动过渡：悬停进/出时边框透明度与底色渐变，160ms。
         let hover_t: f32 = transition(
@@ -107,6 +112,7 @@ impl RenderOnce for Card {
             .border_1()
             .border_color(border_color)
             .bg(surface)
+            .text_color(foreground)
             .cursor_pointer()
             .hover(move |style| style.bg(hover.opacity(0.08 * hover_t)))
             .children(self.children)
