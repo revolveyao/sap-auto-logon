@@ -56,7 +56,10 @@ fn sid_color(
 static ICONS: Mutex<Option<HashMap<(String, String, u32), isize>>> = Mutex::new(None);
 
 /// 扫一遍现有会话窗口，把缺图标的补上。启动时和每次登录后调用即可。
-pub fn apply_session_icons(dark: bool, roles: &std::collections::HashMap<String, String>) {
+pub fn apply_session_icons(
+    roles: &std::collections::HashMap<String, String>,
+    palette: &crate::core::colors::Palette,
+) {
     // 只有 SAP GUI 8.10 且任务栏按「系统标识和客户端」分组时才值得动手：
     // 窗口本来不分组的话，每张图标都一样，画了也没意义。
     if !crate::platform::system::taskbar_grouped_by_system() {
@@ -78,7 +81,7 @@ pub fn apply_session_icons(dark: bool, roles: &std::collections::HashMap<String,
     };
     let icons = guard.get_or_insert_with(HashMap::new);
     // 图标底色跟着当前明暗的那套配色走；换主题后缓存要清，否则还是旧色。
-    let palette = crate::core::colors::Colors::load().palette(dark).clone();
+    
 
     let total = sessions.len();
     for (hwnd, sid, client) in sessions {

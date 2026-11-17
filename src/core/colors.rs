@@ -224,24 +224,6 @@ impl Colors {
         if dark { &self.dark } else { &self.light }
     }
 
-    pub fn path() -> std::path::PathBuf {
-        paths::config_dir().join("colors.json")
-    }
-
-    /// 只用于迁移上一版的单文件配色；现在读写都走 [`ThemeBook`]（每套一个文件）。
-    pub fn load() -> Self {
-        let path = Self::path();
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            return Self::default();
-        };
-        match serde_json::from_str::<Self>(&text) {
-            Ok(colors) => colors,
-            Err(error) => {
-                log::warn!("配色解析失败（{}）：{error}，本次用默认值", path.display());
-                Self::default()
-            }
-        }
-    }
 }
 
 /// 预置主题的源色。取自重设计体系（参考 `sap-theme-studio`），

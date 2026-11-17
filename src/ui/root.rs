@@ -644,8 +644,8 @@ impl RootView {
 
         // 把已经开着的 SAP 会话窗口的任务栏图标按系统标识换掉。
         crate::platform::taskbar::apply_session_icons(
-            cx.theme().is_dark(),
             &view.settings.roles,
+            view.colors().palette(cx.theme().is_dark()),
         );
 
         // 材质是否真的落到 DWM 上，肉眼判断不可靠：启动时读回一次记进日志。
@@ -1953,8 +1953,8 @@ impl RootView {
         let _ = self.settings.save();
         crate::platform::taskbar::clear_icon_cache();
         crate::platform::taskbar::apply_session_icons(
-            cx.theme().is_dark(),
             &self.settings.roles,
+            self.colors().palette(cx.theme().is_dark()),
         );
         cx.notify();
     }
@@ -1985,8 +1985,8 @@ impl RootView {
         if self.book.current_id() == id {
             crate::platform::taskbar::clear_icon_cache();
             crate::platform::taskbar::apply_session_icons(
-                cx.theme().is_dark(),
                 &self.settings.roles,
+                self.colors().palette(cx.theme().is_dark()),
             );
         }
         cx.notify();
@@ -2927,11 +2927,12 @@ impl RootView {
                 // SAP GUI 拉窗口要几秒，等它出现再补任务栏图标；只补这一次，不轮询。
                 let dark = cx.theme().is_dark();
                 let roles = self.settings.roles.clone();
+                let palette = self.colors().palette(dark).clone();
                 cx.spawn(async move |_this, cx| {
                     cx.background_executor()
                         .timer(std::time::Duration::from_millis(4000))
                         .await;
-                    crate::platform::taskbar::apply_session_icons(dark, &roles);
+                    crate::platform::taskbar::apply_session_icons(&roles, &palette);
                 })
                 .detach();
             }
