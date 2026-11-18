@@ -220,3 +220,28 @@ pub fn system_proxy() -> Option<String> {
 pub fn system_proxy() -> Option<String> {
     None
 }
+
+/// 用系统默认程序打开链接（设置页的仓库/反馈入口）。
+#[cfg(target_os = "windows")]
+pub fn open_url(url: &str) {
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+    let operation = wide("open");
+    let target = wide(url);
+    unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            operation.as_ptr(),
+            target.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        );
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn open_url(_url: &str) {}

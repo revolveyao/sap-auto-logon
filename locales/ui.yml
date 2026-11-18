@@ -402,6 +402,12 @@ app:
   role_auto:
     en: "Follow detection"
     zh-CN: "跟随识别"
+  about_hint:
+    en: "report issues on GitHub"
+    zh-CN: "问题与建议请到 GitHub"
+  about_issues:
+    en: "Issues"
+    zh-CN: "反馈问题"
   theme_library:
     en: "Themes"
     zh-CN: "主题库"

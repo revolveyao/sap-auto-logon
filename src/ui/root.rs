@@ -2393,6 +2393,40 @@ impl RootView {
                         .text_color(muted)
                         .child(t!("app.landscape_path", path = landscape_path.clone()).to_string()),
                 )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(rems(0.5))
+                        .pt(rems(0.75))
+                        .child(
+                            div()
+                                .text_size(rems(0.6875))
+                                .text_color(muted)
+                                .child(t!("app.about_hint").to_string()),
+                        )
+                        .child(
+                            Button::new("about-repo")
+                                .small()
+                                .label("GitHub")
+                                .on_click(|_, _, _| {
+                                    crate::platform::system::open_url(
+                                        "https://github.com/revolveyao/sap-auto-logon",
+                                    )
+                                }),
+                        )
+                        .child(
+                            Button::new("about-issues")
+                                .small()
+                                .label(t!("app.about_issues").to_string())
+                                .on_click(|_, _, _| {
+                                    crate::platform::system::open_url(
+                                        "https://github.com/revolveyao/sap-auto-logon/issues",
+                                    )
+                                }),
+                        ),
+                )
                 .footer(
                     div()
                         .flex()
