@@ -2767,9 +2767,15 @@ impl RootView {
     /// 启动进度弹框：Spinner + 说明，启动后由 login 里的定时器自动关闭。
     fn open_launching_dialog(&self, name: String, window: &mut Window, cx: &mut Context<Self>) {
         window.open_dialog(cx, move |dialog, window, cx| {
+            // 对话框默认落在窗口高度的 1/10 处，这个框内容很少、显得贴顶，
+            // 这里按窗口高度算一次垂直居中。
+            let rem = window.rem_size();
+            let dialog_height = rem * 7.0;
+            let margin = (window.viewport_size().height - dialog_height) / 2.;
             dialog
                 .title(t!("app.launching", name = name).to_string())
                 .w(dialog_width(window, 22.5))
+                .margin_top(margin.max(rem))
                 .child(
                     div()
                         .flex()
