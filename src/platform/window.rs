@@ -162,6 +162,49 @@ pub fn backdrop_type() -> Option<u32> {
     (status >= 0).then_some(value)
 }
 
+/// 把 exe 的图标资源设到主窗口上。
+///
+/// gpui 的 `WindowOptions::icon` 只对 X11 生效，Windows 后端不读它；窗口没有自己的
+/// 图标时任务栏按钮会用 exe 的图标，但图标缓存很顽固——换过图标后不显式发一次
+/// `WM_SETICON`，任务栏可能一直显示旧的。
+#[cfg(target_os = "windows")]
+pub fn apply_app_icon() {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::LPARAM;
+    use windows_sys::Win32::UI::Shell::ExtractIconExW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{HICON, SendMessageW};
+
+    // windows-sys 0.61 把 ICON_* 定成了 u32，和 SendMessageW 的 wparam(usize) 对不上。
+    const WM_SETICON: u32 = 0x0080;
+    const ICON_BIG: usize = 1;
+    const ICON_SMALL: usize = 0;
+
+    let Some(hwnd) = find_window() else {
+        log::warn!("窗口图标：没找到主窗口");
+        return;
+    };
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let path: Vec<u16> = exe.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+
+    unsafe {
+        let mut big: HICON = std::ptr::null_mut();
+        let mut small: HICON = std::ptr::null_mut();
+        let count = ExtractIconExW(path.as_ptr(), 0, &mut big, &mut small, 1);
+        if count > 0 {
+            SendMessageW(hwnd, WM_SETICON, ICON_BIG, big as LPARAM);
+            SendMessageW(hwnd, WM_SETICON, ICON_SMALL, small as LPARAM);
+            log::info!("窗口图标：已按 exe 资源设置");
+        } else {
+            log::warn!("窗口图标：exe 里没取到图标（count={count}）");
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn apply_app_icon() {}
+
 #[cfg(not(target_os = "windows"))]
 pub fn hide() {}
 #[cfg(not(target_os = "windows"))]

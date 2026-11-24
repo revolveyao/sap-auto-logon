@@ -96,6 +96,10 @@ fn main() {
                 })
             })
             .expect("failed to open the main window");
+
+            // 窗口出来了再设图标：gpui 的 `WindowOptions::icon` 只在 X11 生效，
+            // Windows 得自己发 WM_SETICON，否则任务栏可能一直用缓存的旧图标。
+            platform::window::apply_app_icon();
         });
 }
 
