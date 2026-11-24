@@ -35,6 +35,7 @@ SAP Logon 里登录一次要点开树、选系统、填客户端和密码。这�
 | 系统角色 | 系统标识包含 D/Q/P 即为 开发/测试/生产（多命中按 P>Q>D），可右键「设置角色…」按 SID 手动指定；卡片徽标与任务栏图标共用 |
 | SAP GUI 特性 | UUID 模式：8.10 及以上默认开启，交给 SAP GUI 自己解析系统 |
 | 国际化 | `locales/ui.yml`（en / zh-CN），跟随系统语言 |
+| 自动更新 | 启动时检查一次（可在设置里关）；下载走加速代理，慢或不通可切回官方 GitHub |
 | 单实例 | `Local\SapAutoLogon.SingleInstance` |
 
 ## 使用

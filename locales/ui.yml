@@ -297,6 +297,21 @@ app:
   update_no_notes:
     en: "No release notes for this version."
     zh-CN: "该版本没有更新说明。"
+  update_route:
+    en: "Download route"
+    zh-CN: "下载线路"
+  update_route_proxy:
+    en: "Accelerator (recommended)"
+    zh-CN: "加速代理（推荐）"
+  update_route_github:
+    en: "GitHub direct"
+    zh-CN: "官方 GitHub"
+  update_proxy:
+    en: "Accelerator"
+    zh-CN: "加速代理"
+  update_proxy_hint:
+    en: "Third-party proxy. Downloads are verified against the SHA-256 published by GitHub."
+    zh-CN: "第三方代理。下载后会核对 GitHub 登记的 SHA-256。"
   update_section:
     en: "Updates"
     zh-CN: "更新"

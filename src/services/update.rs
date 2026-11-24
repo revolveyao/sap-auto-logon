@@ -21,6 +21,9 @@ pub struct Release {
     pub version: String,
     pub notes: String,
     setup_url: String,
+    /// GitHub 为安装包登记的 SHA-256（Release API 的 digest 字段）。
+    /// 走加速代理时靠它证明下载到的包没被替换；发布里没有这个字段时为 None。
+    pub sha256: Option<String>,
 }
 
 /// 查最新 Release；没有更新的版本时返回 `None`。
@@ -53,11 +56,17 @@ pub fn check() -> anyhow::Result<Option<Release>> {
     if setup_url.is_empty() {
         return Err(anyhow::anyhow!("发布里没有安装包地址"));
     }
+    let sha256 = asset["digest"]
+        .as_str()
+        .and_then(|digest| digest.strip_prefix("sha256:"))
+        .map(|value| value.to_ascii_lowercase())
+        .filter(|value| value.len() == 64);
 
     Ok(Some(Release {
         version,
         notes: json["body"].as_str().unwrap_or_default().trim().to_string(),
         setup_url,
+        sha256,
     }))
 }
 
@@ -121,6 +130,8 @@ pub fn prune_stale_setups(current: &str) -> std::io::Result<usize> {
 /// ——GitHub 的下载接口一般带 `Content-Length`，但重定向后不一定。
 pub fn download(
     release: &Release,
+    route: &str,
+    proxy: &str,
     mut on_progress: impl FnMut(u64, Option<u64>),
 ) -> anyhow::Result<PathBuf> {
     let path = setup_path(&release.version);
@@ -130,7 +141,9 @@ pub fn download(
     // 先写 `.part` 再改名：中途失败留下的半个文件不会被 `cached_setup` 当成可用安装包。
     let temp = path.with_extension("exe.part");
 
-    let response = agent().get(&release.setup_url).call()?;
+    let url = effective_url(&release.setup_url, route, proxy);
+    log::info!("更新：下载线路 {route}，地址 {url}");
+    let response = agent().get(&url).call()?;
     let total = response
         .header("Content-Length")
         .and_then(|value| value.parse::<u64>().ok());
@@ -139,6 +152,9 @@ pub fn download(
 
     let mut buffer = vec![0u8; 64 * 1024];
     let mut received = 0u64;
+    // SHA-256 边下边算：走代理时用它核对 GitHub 登记的 digest。
+    use sha2::Digest as _;
+    let mut hasher = sha2::Sha256::new();
     on_progress(0, total);
     loop {
         let read = reader.read(&mut buffer)?;
@@ -146,6 +162,7 @@ pub fn download(
             break;
         }
         file.write_all(&buffer[..read])?;
+        hasher.update(&buffer[..read]);
         received += read as u64;
         on_progress(received, total);
     }
@@ -156,6 +173,21 @@ pub fn download(
         let _ = std::fs::remove_file(&temp);
         return Err(anyhow::anyhow!("下载的安装包不完整"));
     }
+
+    // 走加速代理时代理是第三方：用 GitHub 登记的 SHA-256 核对一遍，
+    // 对不上说明包被换过（或传坏了），直接删掉不装。
+    let actual = format!("{:x}", hasher.finalize());
+    match release.sha256.as_deref() {
+        Some(expected) if expected != actual => {
+            let _ = std::fs::remove_file(&temp);
+            return Err(anyhow::anyhow!(
+                "安装包校验失败：期望 {expected}，实际 {actual}"
+            ));
+        }
+        Some(_) => log::info!("更新：安装包 SHA-256 校验通过"),
+        None => log::warn!("更新：发布里没有 digest，跳过校验（实际 {actual}）"),
+    }
+
     std::fs::rename(&temp, &path)?;
     Ok(path)
 }
@@ -210,4 +242,61 @@ fn is_newer(candidate: &str, current: &str) -> bool {
     left.resize(len, 0);
     right.resize(len, 0);
     left > right
+}
+
+/// 加速代理预设（第三方提供：会知道本机 IP 与所下载的文件）。
+/// 安装包由 Windows 签名且签名覆盖版本号，代理改不了内容、也冒充不了旧版本。
+pub const PROXY_PRESETS: [&str; 3] = [
+    "https://gh-proxy.com/",
+    "https://gh-proxy.org/",
+    "https://ghfast.top/",
+];
+
+/// 按线路把 GitHub 地址换成实际请求地址。
+///
+/// 代理的用法是「前缀 + 完整原地址」，例如
+/// `https://gh-proxy.com/https://github.com/owner/repo/releases/download/...`。
+pub fn effective_url(base: &str, route: &str, proxy: &str) -> String {
+    if route == "github" || base.is_empty() {
+        return base.to_string();
+    }
+    let mut prefix = proxy.trim();
+    if prefix.is_empty() {
+        prefix = PROXY_PRESETS[0];
+    }
+    if prefix.ends_with('/') {
+        format!("{prefix}{base}")
+    } else {
+        format!("{prefix}/{base}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GITHUB: &str = "https://github.com/revolveyao/sap-auto-logon/releases/download/v0.2.15/x-setup.exe";
+
+    #[test]
+    fn github_route_keeps_the_original_url() {
+        assert_eq!(effective_url(GITHUB, "github", PROXY_PRESETS[0]), GITHUB);
+    }
+
+    #[test]
+    fn proxy_route_prefixes_the_url() {
+        let url = effective_url(GITHUB, "proxy", "https://gh-proxy.com/");
+        assert_eq!(url, format!("https://gh-proxy.com/{GITHUB}"));
+    }
+
+    #[test]
+    fn missing_trailing_slash_is_added() {
+        let url = effective_url(GITHUB, "proxy", "https://ghfast.top");
+        assert_eq!(url, format!("https://ghfast.top/{GITHUB}"));
+    }
+
+    #[test]
+    fn empty_proxy_falls_back_to_the_first_preset() {
+        let url = effective_url(GITHUB, "proxy", "  ");
+        assert_eq!(url, format!("{}{GITHUB}", PROXY_PRESETS[0]));
+    }
 }

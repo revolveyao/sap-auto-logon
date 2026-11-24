@@ -80,6 +80,12 @@ pub struct General {
     pub auto_check_update: bool,
     /// 主题库里正在使用的那套（存 id，改名不影响）
     pub theme_id: String,
+    /// 更新下载线路：proxy（走加速代理，默认）/ github（直连）
+    #[serde(default = "default_update_route")]
+    pub update_route: String,
+    /// 加速代理前缀，如 https://gh-proxy.com/
+    #[serde(default = "default_update_proxy")]
+    pub update_proxy: String,
 }
 
 impl Default for General {
@@ -101,6 +107,8 @@ impl Default for General {
             log_dir: String::new(),
             auto_check_update: true,
             theme_id: String::new(),
+            update_route: default_update_route(),
+            update_proxy: default_update_proxy(),
         }
     }
 }
@@ -193,4 +201,13 @@ impl AppSettings {
         std::fs::rename(&temp, &path)?;
         Ok(())
     }
+}
+
+/// 老配置里没有这两个字段时的取值：默认走加速代理。
+fn default_update_route() -> String {
+    "proxy".to_string()
+}
+
+fn default_update_proxy() -> String {
+    crate::services::update::PROXY_PRESETS[0].to_string()
 }

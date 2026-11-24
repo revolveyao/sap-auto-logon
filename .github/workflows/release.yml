@@ -50,25 +50,20 @@ jobs:
           path: dist/*.exe
           if-no-files-found: error
 
-      # 发布说明直接取 tag 的注解正文：打标签时用 `git tag -a v0.2.x -m "改动说明"`，
-      # 不要依赖 GitHub 自动生成（单行提交时它只会给一条 Full Changelog）。
-      - name: Release notes
-        id: notes
-        shell: pwsh
-        run: |
-          $body = git for-each-ref --format='%(contents)' "refs/tags/$env:GITHUB_REF_NAME"
-          if ([string]::IsNullOrWhiteSpace($body)) {
-            $body = git log -1 --pretty=format:'%s'
-            Write-Warning "tag 没有注解正文，回退到最新提交信息"
-          }
-          $body = $body.Trim()
-          "body<<__EOF__" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          $body | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          "__EOF__" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-
+      # 发布说明直接取 tag 的注解正文：打标签时用 `git tag -a v0.2.x -m "改动说明"`。
+      # 不走 `$GITHUB_OUTPUT` 的多行 heredoc——那条路实测只保留第一行，
+      # 改成写文件再交给 gh，多行原样保留。
       - name: Release
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/SAP-Auto-Logon-*-setup.exe
-          body: ${{ steps.notes.outputs.body }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $notes = git for-each-ref --format='%(contents)' "refs/tags/$env:GITHUB_REF_NAME"
+          if ([string]::IsNullOrWhiteSpace($notes)) {
+            $notes = git log -1 --pretty=format:'%s'
+            Write-Warning "tag 没有注解正文，回退到最新提交信息"
+          }
+          Set-Content -Path release-notes.md -Value $notes.Trim() -Encoding utf8NoBOM
+          $files = @(Get-ChildItem dist/*.exe | ForEach-Object { $_.FullName })
+          gh release create $env:GITHUB_REF_NAME @files --title $env:GITHUB_REF_NAME --notes-file release-notes.md

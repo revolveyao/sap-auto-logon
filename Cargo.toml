@@ -1,6 +1,6 @@
 [package]
 name = "sap-auto-logon"
-version = "0.2.15"
+version = "0.2.16"
 edition = "2021"
 description = "SAP Auto Logon"
 license = "MIT"
@@ -22,6 +22,7 @@ roxmltree = "0.20"
 # 应用文案走 rust-i18n；gpui-kit 的组件文案也由它接管（逐键深合并）。
 rust-i18n = "4.2"
 # 检查 GitHub Release 与下载安装包：同步 HTTP，跑在后台线程里。
+sha2 = "0.10"
 ureq = { version = "2", default-features = false, features = ["tls", "gzip"] }
 # 托盘图标与 exe 图标同源，运行时把 PNG 解成 RGBA 交给 tray-icon。
 image = { version = "0.25", default-features = false, features = ["png"] }

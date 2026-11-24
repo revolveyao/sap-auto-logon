@@ -191,7 +191,10 @@ impl UpdateFlow {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    crate::services::update::download(&release, move |got, len| {
+                    let settings = crate::core::settings::AppSettings::load();
+                let route = settings.general.update_route;
+                let proxy = settings.general.update_proxy;
+                crate::services::update::download(&release, &route, &proxy, move |got, len| {
                         report_received.store(got, Ordering::Relaxed);
                         report_total.store(len.unwrap_or(0), Ordering::Relaxed);
                     })
@@ -444,6 +447,8 @@ pub struct RootView {
     /// 上一次自动拼出来的标题：与它不同说明用户手动改过，不再覆盖
     auto_name: String,
     settings_material_select: Entity<SelectState<Vec<String>>>,
+    settings_route_select: Entity<SelectState<Vec<String>>>,
+    settings_proxy_select: Entity<SelectState<Vec<String>>>,
     settings_language_select: Entity<SelectState<Vec<String>>>,
     settings_loglevel_select: Entity<SelectState<Vec<String>>>,
     alias_input: Entity<InputState>,
@@ -540,6 +545,31 @@ impl RootView {
                 cx,
             )
         });
+        let settings_route_select = cx.new(|cx| {
+            let index = if settings.general.update_route == "github" { 1 } else { 0 };
+            SelectState::new(
+                vec![
+                    t!("app.update_route_proxy").to_string(),
+                    t!("app.update_route_github").to_string(),
+                ],
+                Some(IndexPath::new(index)),
+                window,
+                cx,
+            )
+        });
+        let settings_proxy_select = cx.new(|cx| {
+            let presets = crate::services::update::PROXY_PRESETS;
+            let index = presets
+                .iter()
+                .position(|preset| *preset == settings.general.update_proxy.trim())
+                .unwrap_or(0);
+            SelectState::new(
+                presets.iter().map(|preset| preset.to_string()).collect(),
+                Some(IndexPath::new(index)),
+                window,
+                cx,
+            )
+        });
         let settings_language_select = cx.new(|cx| {
             let index = match settings.general.language.as_str() {
                 "zh_CN" | "zh-CN" => 1,
@@ -624,6 +654,8 @@ impl RootView {
             new_base_name: String::new(),
             auto_name: String::new(),
             settings_material_select,
+            settings_route_select,
+            settings_proxy_select,
             settings_language_select,
             settings_loglevel_select,
             alias_input,
@@ -713,6 +745,36 @@ impl RootView {
         )
         .detach();
 
+        cx.subscribe_in(
+            &view.settings_route_select,
+            window,
+            |this, _state, event: &SelectEvent<Vec<String>>, _window, cx| {
+                if let SelectEvent::Confirm(Some(value)) = event {
+                    this.settings.general.update_route = if value.contains("GitHub") {
+                        "github"
+                    } else {
+                        "proxy"
+                    }
+                    .to_string();
+                    let _ = this.settings.save();
+                    cx.notify();
+                }
+            },
+        )
+        .detach();
+
+        cx.subscribe_in(
+            &view.settings_proxy_select,
+            window,
+            |this, _state, event: &SelectEvent<Vec<String>>, _window, cx| {
+                if let SelectEvent::Confirm(Some(value)) = event {
+                    this.settings.general.update_proxy = value.clone();
+                    let _ = this.settings.save();
+                    cx.notify();
+                }
+            },
+        )
+        .detach();
         cx.subscribe_in(
             &view.settings_material_select,
             window,
@@ -2184,6 +2246,8 @@ impl RootView {
         let this = cx.entity().clone();
         let logdir = self.settings_logdir.clone();
         let material = self.settings_material_select.clone();
+        let route_select = self.settings_route_select.clone();
+        let proxy_select = self.settings_proxy_select.clone();
         let language = self.settings_language_select.clone();
         let loglevel = self.settings_loglevel_select.clone();
         let autostart = self.set_autostart.clone();
@@ -2359,6 +2423,25 @@ impl RootView {
                                 cx.notify();
                             });
                         })
+                        .into_any_element(),
+                ))
+                .child(row(
+                    t!("app.update_route").to_string(),
+                    Select::new(&route_select).small().into_any_element(),
+                ))
+                .child(row(
+                    t!("app.update_proxy").to_string(),
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(rems(0.25))
+                        .child(Select::new(&proxy_select).small().into_any_element())
+                        .child(
+                            div()
+                                .text_size(rems(0.625))
+                                .text_color(muted)
+                                .child(t!("app.update_proxy_hint").to_string()),
+                        )
                         .into_any_element(),
                 ))
                 .child(row(
