@@ -75,6 +75,24 @@ app:
   edit_params:
     en: "Edit parameters…"
     zh-CN: "编辑参数…"
+  password:
+    en: "Password"
+    zh-CN: "密码"
+  close:
+    en: "Close"
+    zh-CN: "关闭"
+  copy_password:
+    en: "Copy"
+    zh-CN: "复制"
+  password_copied:
+    en: "Password copied"
+    zh-CN: "密码已复制"
+  show_password:
+    en: "Show password…"
+    zh-CN: "显示密码…"
+  no_saved_password:
+    en: "No password saved for this shortcut"
+    zh-CN: "这条还没有保存密码"
   set_password_menu:
     en: "Set password…"
     zh-CN: "设置密码…"

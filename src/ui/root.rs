@@ -2182,6 +2182,101 @@ impl RootView {
             .unwrap_or_else(|| crate::core::role::SystemRole::detect(systemid))
     }
 
+    /// 查看已保存的密码：默认打码，点「显示」才转明文——防止误露在屏幕上。
+    fn show_saved_password(
+        &mut self,
+        service_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = crate::core::cred::target_for(&service_id);
+        let saved = crate::core::cred::load(&target);
+        // 这个框就是用来「忘了密码查一下」的：直接显示明文，另给一个复制按钮。
+        let this = cx.entity().clone();
+
+        window.open_dialog(cx, move |dialog, window, cx| {
+            let muted = cx.theme().muted_foreground;
+            let copy_this = this.clone();
+
+            let label = move |text: String| {
+                div()
+                    .w(rems(5.0))
+                    .text_size(rems(0.75))
+                    .text_color(muted)
+                    .child(text)
+            };
+
+            let mut body = div().flex().flex_col().gap(rems(0.5));
+            match saved.clone() {
+                Some((user, password)) => {
+                    let copy_text = password.clone();
+                    body = body
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(rems(0.5))
+                                .child(label(t!("app.user").to_string()))
+                                .child(div().text_size(rems(0.8125)).child(user)),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(rems(0.5))
+                                .child(label(t!("app.password").to_string()))
+                                .child(div().text_size(rems(0.8125)).child(password))
+                                .child(
+                                    Button::new("copy-password")
+                                        .small()
+                                        .label(t!("app.copy_password").to_string())
+                                        .on_click(move |_, window, cx| {
+                                            let text = copy_text.clone();
+                                            cx.write_to_clipboard(
+                                                gpui_kit::ClipboardItem::new_string(text),
+                                            );
+                                            copy_this.update(cx, |view, cx| {
+                                                view.toast(
+                                                    t!("app.password_copied").to_string(),
+                                                    NotificationType::Success,
+                                                    window,
+                                                    cx,
+                                                )
+                                            });
+                                        }),
+                                ),
+                        );
+                }
+                None => {
+                    body = body.child(
+                        div()
+                            .text_size(rems(0.75))
+                            .text_color(muted)
+                            .child(t!("app.no_saved_password").to_string()),
+                    );
+                }
+            }
+
+            dialog
+                .title(t!("app.show_password").to_string())
+                .w(dialog_width(window, 22.0))
+                .child(body)
+                .footer(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .justify_end()
+                        .child(
+                            Button::new("password-close")
+                                .primary()
+                                .label(t!("app.close").to_string())
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        ),
+                )
+        });
+    }
     /// 手动指定角色的入口：小对话框，四选一加「跟随识别」。
     fn begin_set_role(&mut self, systemid: String, window: &mut Window, cx: &mut Context<Self>) {
         let this = cx.entity().clone();
@@ -3885,6 +3980,7 @@ impl RootView {
             if in_recent {
                 let login_this = this.clone();
                 let password_this = this.clone();
+                let show_this = this.clone();
                 let edit_this = this.clone();
                 let alias_this = this.clone();
                 let pin_this = this.clone();
@@ -3892,6 +3988,7 @@ impl RootView {
                 let down_this = this.clone();
                 let recent_this = this.clone();
                 let uuid_password = uuid_menu.clone();
+                let uuid_show = uuid_menu.clone();
                 let uuid_edit = uuid_menu.clone();
                 let uuid_alias = uuid_menu.clone();
                 let uuid_role = sid.clone();
@@ -3917,6 +4014,14 @@ impl RootView {
                         let uuid = uuid_password.clone();
                         password_this.update(cx, |view, cx| {
                             view.begin_set_password(uuid, window, cx);
+                        });
+                    }),
+                )
+                .item(
+                    PopupMenuItem::new(t!("app.show_password").to_string()).on_click(move |_, window, cx| {
+                        let uuid = uuid_show.clone();
+                        show_this.update(cx, |view, cx| {
+                            view.show_saved_password(uuid, window, cx);
                         });
                     }),
                 )
@@ -3981,10 +4086,12 @@ impl RootView {
                 let login_this = this.clone();
                 let alias_this = this.clone();
                 let password_this = this.clone();
+                let show_this = this.clone();
                 let edit_this = this.clone();
                 let pin_this = this.clone();
                 let delete_this = this.clone();
                 let uuid_password = uuid_menu.clone();
+                let uuid_show = uuid_menu.clone();
                 let uuid_alias = uuid_menu.clone();
                 let uuid_role = sid.clone();
                                 let role_this = this.clone();
@@ -4008,6 +4115,14 @@ impl RootView {
                         let uuid = uuid_password.clone();
                         password_this.update(cx, |view, cx| {
                             view.begin_set_password(uuid, window, cx);
+                        });
+                    }),
+                )
+                .item(
+                    PopupMenuItem::new(t!("app.show_password").to_string()).on_click(move |_, window, cx| {
+                        let uuid = uuid_show.clone();
+                        show_this.update(cx, |view, cx| {
+                            view.show_saved_password(uuid, window, cx);
                         });
                     }),
                 )
