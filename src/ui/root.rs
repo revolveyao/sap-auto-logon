@@ -2641,10 +2641,16 @@ impl RootView {
     fn apply_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mode = theme_mode(&self.settings.general.theme, window.appearance());
         gpui_kit::component::Theme::change(mode, Some(window), cx);
-        crate::platform::window::set_dark_mode(matches!(
-            mode,
-            gpui_kit::component::ThemeMode::Dark
-        ));
+        let dark = matches!(mode, gpui_kit::component::ThemeMode::Dark);
+        crate::platform::window::set_dark_mode(dark);
+
+        // 任务栏会话图标是按配色画的，浅色/深色两套颜色不同。缓存里存的是换主题前的
+        // 颜色，不清掉就会出现「同一个角色、一张深蓝一张浅蓝」混在一起。
+        crate::platform::taskbar::clear_icon_cache();
+        crate::platform::taskbar::apply_session_icons(
+            &self.settings.roles,
+            self.colors().palette(dark),
+        );
     }
 
     /// 「跟随系统」时窗口外观一变就跟上；固定浅色/深色是用户的明确选择，不响应系统。

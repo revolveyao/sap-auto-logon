@@ -907,3 +907,24 @@ mod tests {
         }
     }
 }
+
+/// 图标底色上压的是白字：深色主题的角色「文字色」本身很浅（`#a8c7f0` 这类），
+/// 直接拿来当底色会和白字糊在一起。这里按 HSL 把亮度压到白字可读的范围，
+/// 色相与饱和度保留，所以看起来还是同一套角色色。
+pub fn readable_on_white_text(hex: &str) -> String {
+    let (r, g, b) = rgb_of(hex);
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let lightness = (max + min) / 2.0;
+    if lightness <= 0.42 {
+        return hex.to_string();
+    }
+    let saturation = if (max - min).abs() < f32::EPSILON {
+        0.0
+    } else if lightness > 0.5 {
+        (max - min) / (2.0 - max - min)
+    } else {
+        (max - min) / (max + min)
+    };
+    hsl_hex(hue_from_rgb(r, g, b), saturation.max(0.35), 0.40)
+}

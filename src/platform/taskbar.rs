@@ -45,7 +45,9 @@ fn sid_color(
         .get(sid)
         .and_then(|key| crate::core::role::SystemRole::from_key(key))
         .unwrap_or_else(|| crate::core::role::SystemRole::detect(sid));
-    let rgba = crate::core::colors::rgba(&palette.role.of_role(role).fg);
+    // 底色上压的是白字：深色主题的文字色太浅，先压到白字可读再用。
+    let hex = crate::core::colors::readable_on_white_text(&palette.role.of_role(role).fg);
+    let rgba = crate::core::colors::rgba(&hex);
     let channel = |value: f32| (value.clamp(0., 1.) * 255.).round() as u8;
     (channel(rgba.r), channel(rgba.g), channel(rgba.b))
 }
@@ -106,7 +108,9 @@ fn icon_for(
     palette: &crate::core::colors::Palette,
     roles: &HashMap<String, String>,
 ) -> isize {
-    let key = (sid.to_string(), client.to_string(), size);
+    // key 里带上底色：换主题后同一个 (SID, 客户端, 尺寸) 也要重画。
+    let (r, g, b) = sid_color(sid, palette, roles);
+    let key = (format!("{sid}|{r:02x}{g:02x}{b:02x}"), client.to_string(), size);
     match icons.get(&key) {
         Some(icon) => *icon,
         None => {
